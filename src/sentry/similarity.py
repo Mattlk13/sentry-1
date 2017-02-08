@@ -32,7 +32,7 @@ def get_euclidian_distance(target, other):
 
 
 def get_manhattan_distance(target, other):
-    """
+    """\
     Calculate the N-dimensional Manhattan distance between two mappings.
 
     The mappings are used to represent sparse arrays -- if a key is not present
