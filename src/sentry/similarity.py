@@ -391,9 +391,12 @@ class ProcessorSet(object):
         results = {}
         for label in self.processors.keys():
             scope = ':'.join((label, str(group.project_id)))
-            results[label] = self.index.query(
-                scope,
-                str(group.id),
+            results[label] = map(
+                lambda (id, score): (int(id), score),
+                self.index.query(
+                    scope,
+                    str(group.id),
+                )
             )
         return results
 
