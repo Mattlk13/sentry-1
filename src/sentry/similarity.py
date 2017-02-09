@@ -343,6 +343,7 @@ class ExceptionProcessor(object):
 
         for exception in exceptions:
             try:
+                # TODO: This shouldn't change the return type of the wrapped function (that can hide errors.)
                 yield set(self.function(exception))
             except Exception as error:
                 self.logger.exception('Could not create signature for exception in %r due to error: %r', event, error)
@@ -361,6 +362,7 @@ class MessageProcessor(object):
             return
 
         try:
+            # TODO: This shouldn't change the return type of the wrapped function (that can hide errors.)
             yield set(self.function(message))
         except Exception as error:
             self.logger.exception('Could not create signature for message of %r due to error: %r', event, error)
