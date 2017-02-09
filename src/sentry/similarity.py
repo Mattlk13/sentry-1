@@ -1,10 +1,14 @@
 from __future__ import absolute_import
 
 import itertools
+import logging
 import math
+import operator
 import struct
 
 import mmh3
+
+from sentry.utils.iterators import shingle
 
 
 def scale_to_total(value):
@@ -272,3 +276,136 @@ class MinHashIndex(object):
         return self.record_multi([
             (scope, key, characteristics),
         ])
+
+
+FRAME_ITEM_SEPARATOR = b'\x00'
+FRAME_PAIR_SEPARATOR = b'\x01'
+FRAME_SEPARATOR = b'\x02'
+
+FRAME_FUNCTION_KEY = b'\x10'
+FRAME_MODULE_KEY = b'\x12'
+FRAME_FILENAME_KEY = b'\x13'
+
+
+def serialize_frame(frame):
+    # TODO(tkaemming): This should likely result in an intermediate data
+    # structure that is easier to introspect than this one, and a separate
+    # serialization step before hashing.
+    # TODO(tkaemming): These frame values need platform-specific normalization.
+    # This probably should be done prior to this method being called...?
+    attributes = {
+        FRAME_FUNCTION_KEY: frame['function']
+    }
+
+    module = frame.get('module')
+    if module:
+        attributes[FRAME_MODULE_KEY] = module
+    else:
+        attributes[FRAME_FILENAME_KEY] = frame['filename']
+
+    return FRAME_ITEM_SEPARATOR.join(
+        map(
+            lambda item: FRAME_PAIR_SEPARATOR.join(
+                map(
+                    operator.methodcaller('encode', 'utf8'),
+                    item,
+                ),
+            ),
+            attributes.items(),
+        ),
+    )
+
+
+def get_application_chunks(exception):
+    return map(
+        lambda (in_app, frames): list(frames),
+        itertools.ifilter(
+            lambda (in_app, frames): in_app,
+            itertools.groupby(
+                exception['stacktrace']['frames'],
+                key=lambda frame: frame.get('in_app', False),
+            )
+        )
+    )
+
+
+class ExceptionProcessor(object):
+    def __init__(self, function):
+        self.function = function
+        self.logger = logging.getLogger(__name__)
+
+    def process(self, event):
+        try:
+            exceptions = event.data['sentry.interfaces.Exception']['values']
+        except KeyError as error:
+            self.logger.info('Could not create signature(s) for %r due error: %r', event, error, exc_info=True)
+            return
+
+        for exception in exceptions:
+            try:
+                yield set(self.function(exception))
+            except Exception as error:
+                self.logger.exception('Could not create signature for exception in %r due to error: %r', event, error)
+
+
+class MessageProcessor(object):
+    def __init__(self, function):
+        self.function = function
+        self.logger = logging.getLogger(__name__)
+
+    def process(self, event):
+        try:
+            message = event.data['sentry.interfaces.Message']
+        except KeyError as error:
+            self.logger.info('Could not create signature(s) for %r due error: %r', event, error, exc_info=True)
+            return
+
+        try:
+            yield set(self.function(message))
+        except Exception as error:
+            self.logger.exception('Could not create signature for message of %r due to error: %r', event, error)
+
+
+processors = {
+    'exception:message:character-shingles': ExceptionProcessor(
+        lambda exception: map(
+            ''.join,
+            shingle(
+                13,
+                exception['value'].encode('utf8'),  # TODO: This should probably happen *after* shingling?
+            ),
+        )
+    ),
+    'exception:stacktrace:application-chunks': ExceptionProcessor(
+        lambda exception: map(
+            lambda frames: FRAME_SEPARATOR.join(
+                map(
+                    serialize_frame,
+                    frames,
+                ),
+            ),
+            get_application_chunks(exception),
+        ),
+    ),
+    'exception:stacktrace:pairs': ExceptionProcessor(
+        lambda exception: map(
+            FRAME_SEPARATOR.join,
+            shingle(
+                2,
+                map(
+                    serialize_frame,
+                    exception['stacktrace']['frames'],
+                ),
+            ),
+        ),
+    ),
+    'message:message:character-shingles': MessageProcessor(
+        lambda message: map(
+            ''.join,
+            shingle(
+                13,
+                message['message'].encode('utf8'),  # TODO: This should probably happen *after* singling?
+            ),
+        ),
+    ),
+}
