@@ -104,8 +104,8 @@ class MinHashIndex(object):
       what other keys may be similar to the lookup key (but not the degree of
       similarity.)
     """
-    BUCKET_MEMBERSHIP = '0'
-    BUCKET_FREQUENCY = '1'
+    BUCKET_MEMBERSHIP = b'\x00'
+    BUCKET_FREQUENCY = b'\x01'
 
     def __init__(self, cluster, rows, bands, buckets):
         self.namespace = b'sim'
@@ -116,6 +116,7 @@ class MinHashIndex(object):
         sequence = itertools.count()
         self.bands = [[next(sequence) for j in xrange(buckets)] for i in xrange(bands)]
 
+        self.__band_format = get_number_format(bands)
         self.__bucket_format = get_number_format(rows, buckets)
 
     def get_signature(self, value):
@@ -173,7 +174,13 @@ class MinHashIndex(object):
                 responses = {
                     key: map(
                         lambda band: client.zrange(
-                            b'{}:{}:{}:{}:{}'.format(self.namespace, scope, self.BUCKET_FREQUENCY, band, key),
+                            b'{}:{}:{}:{}:{}'.format(
+                                self.namespace,
+                                scope,
+                                self.BUCKET_FREQUENCY,
+                                self.__band_format.pack(band),
+                                key,
+                            ),
                             0,
                             -1,
                             desc=True,
@@ -207,7 +214,7 @@ class MinHashIndex(object):
                                 self.namespace,
                                 scope,
                                 self.BUCKET_MEMBERSHIP,
-                                band,
+                                self.__band_format.pack(band),
                                 self.__bucket_format.pack(*bucket),
                             )
                         ),
@@ -263,11 +270,23 @@ class MinHashIndex(object):
                 for band, buckets in enumerate(self.get_signature(characteristics)):
                     buckets = self.__bucket_format.pack(*buckets)
                     client.sadd(
-                        b'{}:{}:{}:{}:{}'.format(self.namespace, scope, self.BUCKET_MEMBERSHIP, band, buckets),
+                        b'{}:{}:{}:{}:{}'.format(
+                            self.namespace,
+                            scope,
+                            self.BUCKET_MEMBERSHIP,
+                            self.__band_format.pack(band),
+                            buckets,
+                        ),
                         key,
                     )
                     client.zincrby(
-                        b'{}:{}:{}:{}:{}'.format(self.namespace, scope, self.BUCKET_FREQUENCY, band, key),
+                        b'{}:{}:{}:{}:{}'.format(
+                            self.namespace,
+                            scope,
+                            self.BUCKET_FREQUENCY,
+                            self.__band_format.pack(band),
+                            key,
+                        ),
                         buckets,
                         1,
                     )
@@ -373,30 +392,38 @@ class ProcessorSet(object):
     def __init__(self, index, processors):
         self.index = index
         self.processors = processors
+        self.__number_format = get_number_format(0xFFFFFFFF)
 
     def record(self, event):
         items = []
         for label, processor in self.processors.items():
-            scope = ':'.join((label, str(event.project_id)))
+            scope = ':'.join((
+                label,
+                self.__number_format.pack(event.project_id),
+            ))
             for characteristics in processor.process(event):
                 if characteristics:
                     items.append((
                         scope,
-                        str(event.group_id),
+                        self.__number_format.pack(event.group_id),
                         characteristics,
                     ))
         return self.index.record_multi(items)
 
     def query(self, group):
         results = {}
+        key = self.__number_format.pack(group.id)
         for label in self.processors.keys():
-            scope = ':'.join((label, str(group.project_id)))
+            scope = ':'.join((
+                label,
+                self.__number_format.pack(group.project_id)
+            ))
             results[label] = map(
-                lambda (id, score): (int(id), score),
-                self.index.query(
-                    scope,
-                    str(group.id),
-                )
+                lambda (id, score): (
+                    self.__number_format.unpack(id)[0],
+                    score,
+                ),
+                self.index.query(scope, key)
             )
         return results
 
