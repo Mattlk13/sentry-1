@@ -428,6 +428,14 @@ class ProcessorSet(object):
         return results
 
 
+aliases = {
+    'exception:message:character-shingles': '\x00',
+    'exception:stacktrace:application-chunks': '\x01',
+    'exception:stacktrace:pairs': '\x02',
+    'message:message:character-shingles': '\x03',
+}
+
+
 processors = ProcessorSet(
     MinHashIndex(
         redis.clusters.get('ephemeral'),
@@ -436,7 +444,7 @@ processors = ProcessorSet(
         2,
     ),
     {
-        'exception:message:character-shingles': ExceptionProcessor(
+        aliases['exception:message:character-shingles']: ExceptionProcessor(
             lambda exception: map(
                 ''.join,
                 shingle(
@@ -445,7 +453,7 @@ processors = ProcessorSet(
                 ),
             )
         ),
-        'exception:stacktrace:application-chunks': ExceptionProcessor(
+        aliases['exception:stacktrace:application-chunks']: ExceptionProcessor(
             lambda exception: map(
                 lambda frames: FRAME_SEPARATOR.join(
                     map(
@@ -456,7 +464,7 @@ processors = ProcessorSet(
                 get_application_chunks(exception),
             ),
         ),
-        'exception:stacktrace:pairs': ExceptionProcessor(
+        aliases['exception:stacktrace:pairs']: ExceptionProcessor(
             lambda exception: map(
                 FRAME_SEPARATOR.join,
                 shingle(
@@ -468,7 +476,7 @@ processors = ProcessorSet(
                 ),
             ),
         ),
-        'message:message:character-shingles': MessageProcessor(
+        aliases['message:message:character-shingles']: MessageProcessor(
             lambda message: map(
                 ''.join,
                 shingle(
