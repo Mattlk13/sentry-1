@@ -8,6 +8,7 @@ import struct
 
 import mmh3
 
+from sentry.utils import redis
 from sentry.utils.iterators import shingle
 
 
@@ -368,46 +369,83 @@ class MessageProcessor(object):
             self.logger.exception('Could not create signature for message of %r due to error: %r', event, error)
 
 
-processors = {
-    'exception:message:character-shingles': ExceptionProcessor(
-        lambda exception: map(
-            ''.join,
-            shingle(
-                13,
-                exception['value'].encode('utf8'),  # TODO: This should probably happen *after* shingling?
-            ),
-        )
+class ProcessorSet(object):
+    def __init__(self, index, processors):
+        self.index = index
+        self.processors = processors
+
+    def record(self, event):
+        items = []
+        for label, processor in self.processors.items():
+            scope = ':'.join((label, str(event.project_id)))
+            for characteristics in processor.process(event):
+                if characteristics:
+                    items.append((
+                        scope,
+                        str(event.group_id),
+                        characteristics,
+                    ))
+        return self.index.record_multi(items)
+
+    def query(self, group):
+        results = {}
+        for label in self.processors.keys():
+            scope = ':'.join((label, str(group.project_id)))
+            results[label] = self.index.query(
+                scope,
+                str(group.id),
+            )
+        return results
+
+
+processors = ProcessorSet(
+    MinHashIndex(
+        redis.clusters.get('ephemeral'),
+        0xFFFF,
+        8,
+        2,
     ),
-    'exception:stacktrace:application-chunks': ExceptionProcessor(
-        lambda exception: map(
-            lambda frames: FRAME_SEPARATOR.join(
-                map(
-                    serialize_frame,
-                    frames,
+    {
+        'exception:message:character-shingles': ExceptionProcessor(
+            lambda exception: map(
+                ''.join,
+                shingle(
+                    13,
+                    exception['value'].encode('utf8'),  # TODO: This should probably happen *after* shingling?
+                ),
+            )
+        ),
+        'exception:stacktrace:application-chunks': ExceptionProcessor(
+            lambda exception: map(
+                lambda frames: FRAME_SEPARATOR.join(
+                    map(
+                        serialize_frame,
+                        frames,
+                    ),
+                ),
+                get_application_chunks(exception),
+            ),
+        ),
+        'exception:stacktrace:pairs': ExceptionProcessor(
+            lambda exception: map(
+                FRAME_SEPARATOR.join,
+                shingle(
+                    2,
+                    map(
+                        serialize_frame,
+                        exception['stacktrace']['frames'],
+                    ),
                 ),
             ),
-            get_application_chunks(exception),
         ),
-    ),
-    'exception:stacktrace:pairs': ExceptionProcessor(
-        lambda exception: map(
-            FRAME_SEPARATOR.join,
-            shingle(
-                2,
-                map(
-                    serialize_frame,
-                    exception['stacktrace']['frames'],
+        'message:message:character-shingles': MessageProcessor(
+            lambda message: map(
+                ''.join,
+                shingle(
+                    13,
+                    message['message'].encode('utf8'),  # TODO: This should probably happen *after* singling?
                 ),
             ),
         ),
-    ),
-    'message:message:character-shingles': MessageProcessor(
-        lambda message: map(
-            ''.join,
-            shingle(
-                13,
-                message['message'].encode('utf8'),  # TODO: This should probably happen *after* singling?
-            ),
-        ),
-    ),
-}
+    }
+)
