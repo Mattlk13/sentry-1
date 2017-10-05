@@ -57,7 +57,7 @@
     "style-loader": "0.12.4",
     "u2f-api": "0.0.8",
     "underscore": "1.8.3",
-    "url-loader": "0.5.6",
+    "url-loader": "0.6.0",
     "webpack": "2.2.0",
     "webpack-dev-middleware": "1.9.0"
   },
