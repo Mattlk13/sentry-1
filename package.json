@@ -46,7 +46,7 @@
     "react-addons-update": "15.3.2",
     "react-bootstrap": "^0.29.5",
     "react-document-title": "1.0.4",
-    "react-dom": "15.3.2",
+    "react-dom": "16.0.1",
     "react-lazy-load": "3.0.10",
     "react-router": "2.8.1",
     "react-sparklines": "1.6.0",
