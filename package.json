@@ -109,7 +109,8 @@
     "webpack": "^4.28.1",
     "webpack-cli": "^3.1.2",
     "webpack-fix-style-only-entries": "^0.2.0",
-    "zxcvbn": "^4.4.2"
+    "zxcvbn": "^4.4.2",
+    "snyk": "^1.189.0"
   },
   "devDependencies": {
     "@babel/plugin-transform-react-jsx-source": "^7.2.0",
@@ -164,10 +165,13 @@
     "storybook": "start-storybook -p 9001 -c .storybook",
     "storybook-build": "build-storybook -c .storybook -o .storybook-out && sed -i -e 's/\\/sb_dll/sb_dll/g' .storybook-out/index.html",
     "snapshot": "build-storybook && PERCY_TOKEN=$STORYBOOK_PERCY_TOKEN PERCY_PROJECT=$STORYBOOK_PERCY_PROJECT percy-storybook --widths=1280",
-    "webpack-profile": "yarn -s webpack --profile --json > stats.json"
+    "webpack-profile": "yarn -s webpack --profile --json > stats.json",
+    "snyk-protect": "snyk protect",
+    "prepublish": "npm run snyk-protect"
   },
   "volta": {
     "node": "8.15.1",
     "yarn": "1.16.0"
-  }
+  },
+  "snyk": true
 }
