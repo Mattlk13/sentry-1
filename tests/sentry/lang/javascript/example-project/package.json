@@ -1,7 +1,7 @@
 {
   "dependencies": {
-    "chrome-launcher": "^0.6.0",
-    "puppeteer": "^0.9.0",
+    "chrome-launcher": "^0.13.2",
+    "puppeteer": "^22.8.2",
     "stacktrace-parser": "^0.1.4",
     "uglify": "^0.1.5"
   }
