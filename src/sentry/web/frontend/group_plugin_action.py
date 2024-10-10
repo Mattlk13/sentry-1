@@ -1,24 +1,29 @@
-from __future__ import absolute_import, division
-
 from django.http import Http404, HttpResponseRedirect
 from django.shortcuts import get_object_or_404
-from sudo.utils import is_safe_url
+from django.utils.http import url_has_allowed_host_and_scheme
+from rest_framework.request import Request
+from rest_framework.response import Response
 
-from sentry.models import Group, GroupMeta
-from sentry.plugins import plugins
-from sentry.web.frontend.base import ProjectView
+from sentry.api.serializers.models.plugin import is_plugin_deprecated
+from sentry.models.group import Group
+from sentry.models.groupmeta import GroupMeta
+from sentry.plugins.base import plugins
+from sentry.web.frontend.base import ProjectView, region_silo_view
 
 
+@region_silo_view
 class GroupPluginActionView(ProjectView):
-    required_scope = 'event:read'
+    required_scope = "event:read"
 
-    def handle(self, request, organization, project, group_id, slug):
+    def handle(self, request: Request, organization, project, group_id, slug) -> Response:
         group = get_object_or_404(Group, pk=group_id, project=project)
 
         try:
             plugin = plugins.get(slug)
+            if is_plugin_deprecated(plugin, project):
+                raise Http404("Plugin not found")
         except KeyError:
-            raise Http404('Plugin not found')
+            raise Http404("Plugin not found")
 
         GroupMeta.objects.populate_cache([group])
 
@@ -26,10 +31,7 @@ class GroupPluginActionView(ProjectView):
         if response:
             return response
 
-        redirect = request.META.get('HTTP_REFERER', '')
-        if not is_safe_url(redirect, host=request.get_host()):
-            redirect = u'/{}/{}/'.format(
-                organization.slug,
-                group.project.slug,
-            )
+        redirect = request.META.get("HTTP_REFERER", "")
+        if not url_has_allowed_host_and_scheme(redirect, allowed_hosts=(request.get_host(),)):
+            redirect = f"/{organization.slug}/{group.project.slug}/"
         return HttpResponseRedirect(redirect)

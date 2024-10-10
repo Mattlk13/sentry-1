@@ -1,192 +1,207 @@
-STATIC_DIR = src/sentry/static/sentry
+.PHONY: all
+all: develop
 
-ifneq "$(wildcard /usr/local/opt/libxmlsec1/lib)" ""
-	LDFLAGS += -L/usr/local/opt/libxmlsec1/lib
-endif
-ifneq "$(wildcard /usr/local/opt/openssl/lib)" ""
-	LDFLAGS += -L/usr/local/opt/openssl/lib
-endif
+PIP := python -m pip --disable-pip-version-check
+WEBPACK := yarn build-acceptance
+POSTGRES_CONTAINER := sentry_postgres
 
-PIP = LDFLAGS="$(LDFLAGS)" pip
-WEBPACK = NODE_ENV=production ./bin/yarn webpack
-YARN = ./bin/yarn
+freeze-requirements:
+	@python3 -S -m tools.freeze_requirements
 
-bootstrap: install-system-pkgs develop init-config run-dependent-services create-db apply-migrations
+bootstrap:
+	@echo "devenv bootstrap is typically run on new machines."
+	@echo "you probably want to run devenv sync to bring the"
+	@echo "sentry dev environment up to date!"
 
-develop: setup-git ensure-venv develop-only
+build-platform-assets \
+clean \
+init-config \
+run-dependent-services \
+drop-db \
+create-db \
+apply-migrations \
+reset-db :
+	@./scripts/do.sh $@
 
-develop-only: update-submodules install-yarn-pkgs install-sentry-dev
+develop \
+install-js-dev \
+install-py-dev :
+	@make devenv-sync
 
-init-config:
-	sentry init --dev
+# This is to ensure devenv sync's only called once if the above
+# macros are combined e.g. `make install-js-dev install-py-dev`
+.PHONY: devenv-sync
+devenv-sync:
+	devenv sync
 
-run-dependent-services:
-	sentry devservices up
+build-js-po:
+	mkdir -p build
+	rm -rf node_modules/.cache/babel-loader
+	SENTRY_EXTRACT_TRANSLATIONS=1 $(WEBPACK)
 
-test: develop lint test-js test-python test-cli
+build-spectacular-docs:
+	@echo "--> Building drf-spectacular openapi spec (combines with deprecated docs)"
+	@OPENAPIGENERATE=1 sentry django spectacular --file tests/apidocs/openapi-spectacular.json --format openapi-json --validate --fail-on-warn
 
-ensure-venv:
-	@./scripts/ensure-venv.sh
+build-deprecated-docs:
+	@echo "--> Building deprecated openapi spec from json files"
+	yarn build-deprecated-docs
+
+build-api-docs: build-deprecated-docs build-spectacular-docs
+	@echo "--> Dereference the json schema for ease of use"
+	yarn deref-api-docs
+
+watch-api-docs:
+	@cd api-docs/ && yarn install
+	@cd api-docs/ && ts-node ./watch.ts
+
+diff-api-docs:
+	@echo "--> diffing local api docs against sentry-api-schema/openapi-derefed.json"
+	yarn diff-docs
 
 build: locale
 
-drop-db:
-	@echo "--> Dropping existing 'sentry' database"
-	dropdb -h 127.0.0.1 -U postgres sentry || true
-
-create-db:
-	@echo "--> Creating 'sentry' database"
-	createdb -h 127.0.0.1 -U postgres -E utf-8 sentry || true
-
-apply-migrations:
-	@echo "--> Applying migrations"
-	sentry upgrade
-
-reset-db: drop-db create-db apply-migrations
-
-clean:
-	@echo "--> Cleaning static cache"
-	rm -rf dist/* static/dist/*
-	@echo "--> Cleaning integration docs cache"
-	rm -rf src/sentry/integration-docs
-	@echo "--> Cleaning pyc files"
-	find . -name "*.pyc" -delete
-	@echo "--> Cleaning python build artifacts"
-	rm -rf build/ dist/ src/sentry/assets.json
-	@echo ""
-
-setup-git:
-	@echo "--> Installing git hooks"
-	git config branch.autosetuprebase always
-	git config core.ignorecase false
-	cd .git/hooks && ln -sf ../../config/hooks/* ./
-	pip install "pre-commit>=1.10.1,<1.11.0"
-	pre-commit install
-	@echo ""
-
-update-submodules:
-	@echo "--> Updating git submodules"
-	git submodule init
-	git submodule update
-	@echo ""
-
-node-version-check:
-	@test "$$(node -v)" = v"$$(cat .nvmrc)" || (echo 'node version does not match .nvmrc. Recommended to use https://github.com/creationix/nvm'; exit 1)
-
-install-system-pkgs: node-version-check
-	@echo "--> Installing system packages (from Brewfile)"
-	@command -v brew 2>&1 > /dev/null && brew bundle || (echo 'WARNING: homebrew not found or brew bundle failed - skipping system dependencies.')
-
-install-yarn-pkgs:
-	@echo "--> Installing Yarn packages (for development)"
-	@command -v $(YARN) 2>&1 > /dev/null || (echo 'yarn not found. Please install it before proceeding.'; exit 1)
-	# Use NODE_ENV=development so that yarn installs both dependencies + devDependencies
-	NODE_ENV=development $(YARN) install --pure-lockfile
-	# A common problem is with node packages not existing in `node_modules` even though `yarn install`
-	# says everything is up to date. Even though `yarn install` is run already, it doesn't take into
-	# account the state of the current filesystem (it only checks .yarn-integrity).
-	# Add an additional check against `node_modules`
-	$(YARN) check --verify-tree || $(YARN) install --check-files
-
-install-sentry-dev:
-	@echo "--> Installing Sentry (for development)"
-	$(PIP) install -e ".[dev,tests,optional]"
-
-build-js-po: node-version-check
-	mkdir -p build
-	SENTRY_EXTRACT_TRANSLATIONS=1 $(WEBPACK)
-
-locale: build-js-po
+merge-locale-catalogs: build-js-po
+	$(PIP) install Babel
 	cd src/sentry && sentry django makemessages -i static -l en
 	./bin/merge-catalogs en
+
+compile-locale:
+	$(PIP) install Babel
 	./bin/find-good-catalogs src/sentry/locale/catalogs.json
 	cd src/sentry && sentry django compilemessages
 
-update-transifex: build-js-po
+install-transifex:
 	$(PIP) install transifex-client
-	cd src/sentry && sentry django makemessages -i static -l en
-	./bin/merge-catalogs en
+
+push-transifex: merge-locale-catalogs install-transifex
 	tx push -s
+
+pull-transifex: install-transifex
 	tx pull -a
-	./bin/find-good-catalogs src/sentry/locale/catalogs.json
-	cd src/sentry && sentry django compilemessages
 
-build-platform-assets:
-	@echo "--> Building platform assets"
-	@echo "from sentry.utils.integrationdocs import sync_docs; sync_docs(quiet=True)" | sentry exec
+# Update transifex with new strings that need to be translated
+update-transifex: push-transifex
 
-fetch-release-registry:
-	@echo "--> Fetching release registry"
-	@echo "from sentry.utils.distutils import sync_registry; sync_registry()" | sentry exec
+# Pulls new translations from transifex and compiles for usage
+update-local-locales: pull-transifex compile-locale
 
-test-cli:
+build-chartcuterie-config:
+	@echo "--> Building chartcuterie config module"
+	yarn build-chartcuterie-config
+
+run-acceptance:
+	@echo "--> Running acceptance tests"
+	python3 -b -m pytest tests/acceptance --cov . --cov-report="xml:.artifacts/acceptance.coverage.xml" --json-report --json-report-file=".artifacts/pytest.acceptance.json" --json-report-omit=log --junit-xml=".artifacts/acceptance.junit.xml" -o junit_suite_name=acceptance
+	@echo ""
+
+test-cli: create-db
 	@echo "--> Testing CLI"
 	rm -rf test_cli
 	mkdir test_cli
-	cd test_cli && sentry init test_conf > /dev/null
-	cd test_cli && sentry --config=test_conf upgrade --traceback --noinput > /dev/null
-	cd test_cli && sentry --config=test_conf help 2>&1 | grep start > /dev/null
+	cd test_cli && sentry init test_conf
+	cd test_cli && sentry --config=test_conf help
+	cd test_cli && sentry --config=test_conf upgrade --traceback --noinput
+	cd test_cli && sentry --config=test_conf export
 	rm -r test_cli
 	@echo ""
 
-test-js: node-version-check
+test-js-build:
+	@echo "--> Running type check"
+	@yarn run tsc -p config/tsconfig.build.json
 	@echo "--> Building static assets"
-	@$(WEBPACK) --profile --json > .artifacts/webpack-stats.json
+	@NODE_ENV=production yarn webpack-profile > .artifacts/webpack-stats.json
+
+test-js:
 	@echo "--> Running JavaScript tests"
-	@$(YARN) run test-ci
+	@yarn run test
 	@echo ""
 
-# builds and creates percy snapshots
-test-styleguide:
-	@echo "--> Building and snapshotting styleguide"
-	@$(YARN) run snapshot
+test-js-ci:
+	@echo "--> Running CI JavaScript tests"
+	@yarn run test-ci
 	@echo ""
 
-test-python:
-	sentry init
-	make build-platform-assets
-	@echo "--> Running Python tests"
-ifndef TEST_GROUP
-	py.test tests/integration tests/sentry --cov . --cov-report="xml:.artifacts/python.coverage.xml" --junit-xml=".artifacts/python.junit.xml" || exit 1
-else
-	py.test tests/integration tests/sentry -m group_$(TEST_GROUP) --cov . --cov-report="xml:.artifacts/python.coverage.xml" --junit-xml=".artifacts/python.junit.xml" || exit 1
-endif
+# COV_ARGS controls extra args passed to pytest to generate covereage
+# It's used in test-python-ci. Typically generated an XML coverage file
+# Except in .github/workflows/codecov_per_test_coverage.yml
+# When it's dynamically changed to include --cov-context=test flag
+# See that workflow for more info
+COV_ARGS = --cov-report="xml:.artifacts/python.coverage.xml"
+
+test-python-ci:
+	@echo "--> Running CI Python tests"
+	python3 -b -m pytest \
+		tests \
+		--ignore tests/acceptance \
+		--ignore tests/apidocs \
+		--ignore tests/js \
+		--ignore tests/tools \
+		--cov . $(COV_ARGS) \
+		--json-report \
+		--json-report-file=".artifacts/pytest.json" \
+		--json-report-omit=log \
+		--junit-xml=.artifacts/pytest.junit.xml \
+		-o junit_suite_name=pytest
 	@echo ""
 
-test-riak:
-	sentry init
-	@echo "--> Running Riak tests"
-	py.test tests/sentry/nodestore/riak/backend --cov . --cov-report="xml:.artifacts/riak.coverage.xml" --junit-xml=".artifacts/riak.junit.xml" || exit 1
+# it's not possible to change settings.DATABASE after django startup, so
+# unfortunately these tests must be run in a separate pytest process. References:
+#   * https://docs.djangoproject.com/en/4.2/topics/testing/tools/#overriding-settings
+#   * https://code.djangoproject.com/ticket/19031
+#   * https://github.com/pombredanne/django-database-constraints/blob/master/runtests.py#L61-L77
+test-monolith-dbs:
+	@echo "--> Running CI Python tests (SENTRY_USE_MONOLITH_DBS=1)"
+	SENTRY_LEGACY_TEST_SUITE=1 \
+	SENTRY_USE_MONOLITH_DBS=1 \
+	python3 -b -m pytest \
+	  tests/sentry/backup/test_exhaustive.py \
+	  tests/sentry/backup/test_exports.py \
+	  tests/sentry/backup/test_imports.py \
+	  tests/sentry/backup/test_releases.py \
+	  tests/sentry/runner/commands/test_backup.py \
+	  --cov . \
+	  --cov-report="xml:.artifacts/python.monolith-dbs.coverage.xml" \
+	  --json-report \
+	  --json-report-file=".artifacts/pytest.monolith-dbs.json" \
+	  --json-report-omit=log \
+	  --junit-xml=.artifacts/monolith-dbs.junit.xml \
+	  -o junit_suite_name=monolith-dbs \
+	;
 	@echo ""
 
-test-snuba:
-	@echo "--> Running snuba tests"
-	py.test tests/snuba tests/sentry/eventstream/kafka -vv --cov . --cov-report="xml:.artifacts/snuba.coverage.xml" --junit-xml=".artifacts/snuba.junit.xml"
+test-tools:
+	@echo "--> Running tools tests"
+	@# bogus configuration to force vanilla pytest
+	python3 -b -m pytest -c setup.cfg --confcutdir tests/tools tests/tools -vv --cov=tools --cov=tests/tools --cov-report="xml:.artifacts/tools.coverage.xml" --junit-xml=.artifacts/tools.junit.xml -o junit_suite_name=tools
 	@echo ""
 
+# JavaScript relay tests are meant to be run within Symbolicator test suite, as they are parametrized to verify both processing pipelines during migration process.
+# Running Locally: Run `sentry devservices up kafka` before starting these tests
 test-symbolicator:
 	@echo "--> Running symbolicator tests"
-	py.test tests/symbolicator -vv --cov . --cov-report="xml:.artifacts/symbolicator.coverage.xml" --junit-xml=".artifacts/symbolicator.junit.xml"
+	python3 -b -m pytest tests/symbolicator -vv --cov . --cov-report="xml:.artifacts/symbolicator.coverage.xml" --junit-xml=.artifacts/symbolicator.junit.xml -o junit_suite_name=symbolicator
+	python3 -b -m pytest tests/relay_integration/lang/javascript/ -vv -m symbolicator
+	python3 -b -m pytest tests/relay_integration/lang/java/ -vv -m symbolicator
 	@echo ""
 
-test-acceptance: node-version-check
-	sentry init
+test-acceptance:
 	@echo "--> Building static assets"
-	@$(WEBPACK) --display errors-only
-	@echo "--> Running acceptance tests"
-ifndef TEST_GROUP
-	py.test tests/acceptance --cov . --cov-report="xml:.artifacts/acceptance.coverage.xml" --junit-xml=".artifacts/acceptance.junit.xml" --html=".artifacts/acceptance.pytest.html"
-else
-	py.test tests/acceptance -m group_$(TEST_GROUP) --cov . --cov-report="xml:.artifacts/acceptance.coverage.xml" --junit-xml=".artifacts/acceptance.junit.xml" --html=".artifacts/acceptance.pytest.html"
-endif
+	@$(WEBPACK)
+	make run-acceptance
 
+# XXX: this is called by `getsentry/relay`
+test-relay-integration:
+	@echo "--> Running Relay integration tests"
+	python3 -b -m pytest \
+		tests/relay_integration \
+		tests/sentry/ingest/ingest_consumer/test_ingest_consumer_kafka.py \
+		-vv --cov . --cov-report="xml:.artifacts/relay.coverage.xml"
 	@echo ""
 
-lint: lint-python lint-js
-
-lint-python:
-	@echo "--> Linting python"
-	bash -eo pipefail -c "flake8 | tee .artifacts/flake8.pycodestyle.log"
+test-api-docs: build-api-docs
+	yarn run validate-api-examples
+	python3 -b -m pytest tests/apidocs
 	@echo ""
 
 review-python-snapshots:
@@ -201,58 +216,4 @@ reject-python-snapshots:
 	@cargo insta --version &> /dev/null || cargo install cargo-insta
 	@cargo insta reject --workspace-root `pwd` -e pysnap
 
-lint-js:
-	@echo "--> Linting javascript"
-	bin/lint --js --parseable
-	@echo ""
-
-publish:
-	python setup.py sdist bdist_wheel upload
-
-
-.PHONY: develop develop-only test build test reset-db clean setup-git update-submodules node-version-check install-system-pkgs install-yarn-pkgs install-sentry-dev build-js-po locale update-transifex build-platform-assets test-cli test-js test-styleguide test-python test-snuba test-symbolicator test-acceptance lint lint-python lint-js publish
-
-
-############################
-# Halt, Travis stuff below #
-############################
-
-.PHONY: travis-noop
-travis-noop:
-	@echo "nothing to do here."
-
-.PHONY: travis-test-lint
-travis-test-lint: lint-python lint-js
-
-.PHONY: travis-test-postgres travis-test-acceptance travis-test-snuba travis-test-symbolicator travis-test-js travis-test-cli travis-test-dist travis-test-riak
-travis-test-postgres: test-python
-travis-test-acceptance: test-acceptance
-travis-test-snuba: test-snuba
-travis-test-symbolicator: test-symbolicator
-travis-test-js: test-js
-travis-test-cli: test-cli
-travis-test-dist:
-	# NOTE: We quiet down output here to workaround an issue in travis that
-	# causes the build to fail with a EAGAIN when writing a large amount of
-	# data to STDOUT.
-	# See: https://github.com/travis-ci/travis-ci/issues/4704
-	SENTRY_BUILD=$(TRAVIS_COMMIT) SENTRY_LIGHT_BUILD=0 python setup.py -q sdist bdist_wheel
-	@ls -lh dist/
-travis-test-riak: test-riak
-
-.PHONY: scan-python travis-scan-postgres travis-scan-acceptance travis-scan-snuba travis-scan-symbolicator travis-scan-js travis-scan-cli travis-scan-dist travis-scan-lint travis-scan-riak
-scan-python:
-	@echo "--> Running Python vulnerability scanner"
-	$(PIP) install safety
-	bin/scan
-	@echo ""
-
-travis-scan-postgres: travis-noop
-travis-scan-acceptance: travis-noop
-travis-scan-snuba: travis-noop
-travis-scan-symbolicator: travis-noop
-travis-scan-js: travis-noop
-travis-scan-cli: travis-noop
-travis-scan-dist: travis-noop
-travis-scan-lint: scan-python
-travis-scan-riak: travis-noop
+.PHONY: build

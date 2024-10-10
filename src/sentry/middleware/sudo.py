@@ -1,13 +1,15 @@
-from __future__ import absolute_import
+from django.http.request import HttpRequest
 
 from sudo.middleware import SudoMiddleware as BaseSudoMiddleware
 
 
 class SudoMiddleware(BaseSudoMiddleware):
-    def has_sudo_privileges(self, request):
-        # Users without a password are assumed to always have sudo powers
+    def has_sudo_privileges(self, request: HttpRequest) -> bool:
+        # Right now, only password reauthentication (django-sudo) is supported,
+        # so if a user doesn't have a password (for example, only has github auth)
+        # then we shouldn't prompt them for the password they don't have.
         user = request.user
-        if user.is_authenticated() and not user.has_usable_password():
+        if user.is_authenticated and not user.has_usable_password():
             return True
 
-        return super(SudoMiddleware, self).has_sudo_privileges(request)
+        return super().has_sudo_privileges(request)

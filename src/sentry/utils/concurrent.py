@@ -1,21 +1,26 @@
-from __future__ import absolute_import
+from __future__ import annotations
 
+import functools
 import logging
-import sys
 import threading
-from Queue import Full, PriorityQueue
-from concurrent.futures import Future
-from concurrent.futures._base import RUNNING, FINISHED
+from collections.abc import Callable
+from concurrent.futures import Future, InvalidStateError
+from concurrent.futures._base import FINISHED, RUNNING
+from contextlib import contextmanager
+from queue import Full, PriorityQueue
 from time import time
+from typing import Generic, NamedTuple, TypeVar
 
-from six.moves import xrange
-
+import sentry_sdk
+import sentry_sdk.scope
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
 
-def execute(function, daemon=True):
-    future = Future()
+
+def execute(function: Callable[..., T], daemon=True):
+    future: Future[T] = Future()
 
     def run():
         if not future.set_running_or_notify_cancel():
@@ -23,8 +28,8 @@ def execute(function, daemon=True):
 
         try:
             result = function()
-        except Exception:
-            future.set_exception_info(*sys.exc_info()[1:])
+        except Exception as e:
+            future.set_exception(e)
         else:
             future.set_result(result)
 
@@ -35,10 +40,25 @@ def execute(function, daemon=True):
     return future
 
 
-class TimedFuture(Future):
+@functools.total_ordering
+class PriorityTask(NamedTuple, Generic[T]):
+    priority: int
+    item: tuple[sentry_sdk.Scope, sentry_sdk.Scope, Callable[[], T], Future[T]]
+
+    def __eq__(self, b):
+        return self.priority == b.priority
+
+    def __lt__(self, b):
+        return self.priority < b.priority
+
+
+class TimedFuture(Future[T]):
+    _condition: threading.Condition
+    _state: str
+
     def __init__(self, *args, **kwargs):
-        self.__timing = [None, None]  # [started, finished/cancelled]
-        super(TimedFuture, self).__init__(*args, **kwargs)
+        self.__timing: list[float | None] = [None, None]  # [started, finished/cancelled]
+        super().__init__(*args, **kwargs)
 
     def get_timing(self):
         """\
@@ -49,7 +69,7 @@ class TimedFuture(Future):
         a timestamp or ``None`` (if the future has not been either completed or
         cancelled.)
 
-        There are some idiosyncracies with the way the timings are recorded:
+        There are some idiosyncrasies with the way the timings are recorded:
 
         - The ``started`` value will generally not be ``None`` if the
           ``finished`` value is also not ``None``. However, for a future that
@@ -65,7 +85,7 @@ class TimedFuture(Future):
         return tuple(self.__timing)
 
     def set_running_or_notify_cancel(self, *args, **kwargs):
-        result = super(TimedFuture, self).set_running_or_notify_cancel(*args, **kwargs)
+        result = super().set_running_or_notify_cancel(*args, **kwargs)
         # This method can only be called once (the second invocation will raise
         # a ``RuntimeError``) so if we've gotten this far we can be reasonably
         # confident that the start time hasn't been set.
@@ -83,26 +103,28 @@ class TimedFuture(Future):
             # future was cancelled.
             if self._state not in [RUNNING, FINISHED] and self.__timing[1] is None:
                 self.__timing[1] = time()
-            return super(TimedFuture, self).cancel(*args, **kwargs)
+            return super().cancel(*args, **kwargs)
+
+    @contextmanager
+    def __set_finished_time_on_success(self):
+        prev_value = self.__timing[1]
+        self.__timing[1] = time()
+        try:
+            yield
+        except InvalidStateError:
+            self.__timing[1] = prev_value
+            raise
 
     def set_result(self, *args, **kwargs):
-        with self._condition:
-            # This method always overwrites the result, so we always overwrite
-            # the timing, even if another timing was already recorded.
-            self.__timing[1] = time()
-            return super(TimedFuture, self).set_result(*args, **kwargs)
+        with self._condition, self.__set_finished_time_on_success():
+            return super().set_result(*args, **kwargs)
 
-    def set_exception_info(self, *args, **kwargs):
-        # XXX: This makes the potentially unsafe assumption that
-        # ``set_exception`` will always continue to call this function.
-        with self._condition:
-            # This method always overwrites the result, so we always overwrite
-            # the timing, even if another timing was already recorded.
-            self.__timing[1] = time()
-            return super(TimedFuture, self).set_exception_info(*args, **kwargs)
+    def set_exception(self, *args, **kwargs):
+        with self._condition, self.__set_finished_time_on_success():
+            return super().set_exception(*args, **kwargs)
 
 
-class Executor(object):
+class Executor(Generic[T]):
     """
     This class provides an API for executing tasks in different contexts
     (immediately, or asynchronously.)
@@ -113,9 +135,10 @@ class Executor(object):
     similar), and ``submit`` passes all additional arguments to ``queue.put``
     to allow controlling whether or not queue insertion should be blocking.
     """
+
     Future = TimedFuture
 
-    def submit(self, callable, priority=0, block=True, timeout=None):
+    def submit(self, callable, priority=0, block=True, timeout=None) -> TimedFuture[T]:
         """
         Enqueue a task to be executed, returning a ``TimedFuture``.
 
@@ -126,7 +149,7 @@ class Executor(object):
         raise NotImplementedError
 
 
-class SynchronousExecutor(Executor):
+class SynchronousExecutor(Executor[T]):
     """
     This executor synchronously executes callables in the current thread.
 
@@ -141,18 +164,18 @@ class SynchronousExecutor(Executor):
         """
         Immediately execute a callable, returning a ``TimedFuture``.
         """
-        future = self.Future()
+        future: Future[T] = self.Future()
         assert future.set_running_or_notify_cancel()
         try:
             result = callable()
-        except Exception:
-            future.set_exception_info(*sys.exc_info()[1:])
+        except Exception as e:
+            future.set_exception(e)
         else:
             future.set_result(result)
         return future
 
 
-class ThreadedExecutor(Executor):
+class ThreadedExecutor(Executor[T]):
     """\
     This executor provides a method of executing callables in a threaded worker
     pool. The number of outstanding requests can be limited by the ``maxsize``
@@ -165,31 +188,34 @@ class ThreadedExecutor(Executor):
 
     def __init__(self, worker_count=1, maxsize=0):
         self.__worker_count = worker_count
-        self.__workers = set([])
+        self.__workers = set()
         self.__started = False
-        self.__queue = PriorityQueue(maxsize)
+        self.__queue: PriorityQueue[PriorityTask[T]] = PriorityQueue(maxsize)
         self.__lock = threading.Lock()
 
     def __worker(self):
         queue = self.__queue
         while True:
-            priority, (function, future) = queue.get(True)
-            if not future.set_running_or_notify_cancel():
-                continue
-            try:
-                result = function()
-            except Exception:
-                future.set_exception_info(*sys.exc_info()[1:])
-            else:
-                future.set_result(result)
-            queue.task_done()
+            priority, item = queue.get(True)
+            thread_isolation_scope, thread_current_scope, function, future = item
+            with sentry_sdk.scope.use_isolation_scope(thread_isolation_scope):
+                with sentry_sdk.scope.use_scope(thread_current_scope):
+                    if not future.set_running_or_notify_cancel():
+                        continue
+                    try:
+                        result = function()
+                    except Exception as e:
+                        future.set_exception(e)
+                    else:
+                        future.set_result(result)
+                    queue.task_done()
 
     def start(self):
         with self.__lock:
             if self.__started:
                 return
 
-            for i in xrange(self.__worker_count):
+            for i in range(self.__worker_count):
                 t = threading.Thread(target=self.__worker)
                 t.daemon = True
                 t.start()
@@ -211,8 +237,16 @@ class ThreadedExecutor(Executor):
         if not self.__started:
             self.start()
 
-        future = self.Future()
-        task = (priority, (callable, future))
+        future: Future[T] = self.Future()
+        task = PriorityTask(
+            priority,
+            (
+                sentry_sdk.Scope.get_isolation_scope(),
+                sentry_sdk.Scope.get_current_scope(),
+                callable,
+                future,
+            ),
+        )
         try:
             self.__queue.put(task, block=block, timeout=timeout)
         except Full as error:
@@ -221,7 +255,7 @@ class ThreadedExecutor(Executor):
         return future
 
 
-class FutureSet(object):
+class FutureSet:
     """\
     Coordinates a set of ``Future`` objects (either from
     ``concurrent.futures``, or otherwise API compatible), and allows for
@@ -246,9 +280,7 @@ class FutureSet(object):
         try:
             callback(self)
         except Exception as error:
-            logger.warning(
-                'Error when calling callback %r: %s',
-                callback, error, exc_info=True)
+            logger.warning("Error when calling callback %r: %s", callback, error, exc_info=True)
 
     def __mark_completed(self, future):
         with self.__lock:

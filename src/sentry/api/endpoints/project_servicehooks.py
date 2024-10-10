@@ -1,46 +1,34 @@
-from __future__ import absolute_import
+from __future__ import annotations
 
-from django.db import transaction
 from rest_framework import status
+from rest_framework.request import Request
+from rest_framework.response import Response
 
-from sentry import features
-from sentry.api.base import DocSection
+from sentry import audit_log, features
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import region_silo_endpoint
 from sentry.api.bases.project import ProjectEndpoint
 from sentry.api.serializers import serialize
-from sentry.api.validators import ServiceHookValidator
-from sentry.mediators import service_hooks
-from sentry.models import AuditLogEntryEvent, ObjectStatus, ServiceHook
-from sentry.utils.apidocs import scenario, attach_scenarios
+from sentry.constants import ObjectStatus
+from sentry.sentry_apps.api.parsers.servicehook import ServiceHookValidator
+from sentry.sentry_apps.api.serializers.servicehook import ServiceHookSerializer
+from sentry.sentry_apps.models.servicehook import ServiceHook
+from sentry.sentry_apps.services.hook import hook_service
 
 
-@scenario('ListServiceHooks')
-def list_hooks_scenario(runner):
-    runner.request(
-        method='GET', path='/projects/%s/%s/hooks/' % (runner.org.slug, runner.default_project.slug)
-    )
-
-
-@scenario('CreateServiceHook')
-def create_hook_scenario(runner):
-    runner.request(
-        method='POST',
-        path='/projects/%s/%s/hooks/' % (runner.org.slug, runner.default_project.slug),
-        data={'url': 'https://example.com/sentry-hook', 'events': ['event.alert', 'event.created']}
-    )
-
-
+@region_silo_endpoint
 class ProjectServiceHooksEndpoint(ProjectEndpoint):
-    doc_section = DocSection.PROJECTS
+    owner = ApiOwner.INTEGRATIONS
+    publish_status = {
+        "GET": ApiPublishStatus.UNKNOWN,
+        "POST": ApiPublishStatus.UNKNOWN,
+    }
 
-    def has_feature(self, request, project):
-        return features.has(
-            'projects:servicehooks',
-            project=project,
-            actor=request.user,
-        )
+    def has_feature(self, request: Request, project):
+        return features.has("projects:servicehooks", project=project, actor=request.user)
 
-    @attach_scenarios([list_hooks_scenario])
-    def get(self, request, project):
+    def get(self, request: Request, project) -> Response:
         """
         List a Project's Service Hooks
         ``````````````````````````````
@@ -50,42 +38,38 @@ class ProjectServiceHooksEndpoint(ProjectEndpoint):
         This endpoint requires the 'servicehooks' feature to
         be enabled for your project.
 
-        :pparam string organization_slug: the slug of the organization the
+        :pparam string organization_id_or_slug: the id or slug of the organization the
                                           client keys belong to.
-        :pparam string project_slug: the slug of the project the client keys
+        :pparam string project_id_or_slug: the id or slug of the project the client keys
                                      belong to.
         :auth: required
         """
         if not self.has_feature(request, project):
-            return self.respond({
-                'error_type': 'unavailable_feature',
-                'detail': ['You do not have that feature enabled']
-            }, status=403)
+            return self.respond(
+                {
+                    "error_type": "unavailable_feature",
+                    "detail": ["You do not have that feature enabled"],
+                },
+                status=403,
+            )
 
-        queryset = ServiceHook.objects.filter(
-            project_id=project.id,
-        )
-        status = request.GET.get('status')
-        if status == 'active':
-            queryset = queryset.filter(
-                status=ObjectStatus.ACTIVE,
-            )
-        elif status == 'disabled':
-            queryset = queryset.filter(
-                status=ObjectStatus.DISABLED,
-            )
+        queryset = ServiceHook.objects.filter(project_id=project.id)
+        status = request.GET.get("status")
+        if status == "active":
+            queryset = queryset.filter(status=ObjectStatus.ACTIVE)
+        elif status == "disabled":
+            queryset = queryset.filter(status=ObjectStatus.DISABLED)
         elif status:
             queryset = queryset.none()
 
         return self.paginate(
             request=request,
             queryset=queryset,
-            order_by='-id',
-            on_results=lambda x: serialize(x, request.user),
+            order_by="-id",
+            on_results=lambda x: serialize(x, request.user, ServiceHookSerializer()),
         )
 
-    @attach_scenarios([create_hook_scenario])
-    def post(self, request, project):
+    def post(self, request: Request, project) -> Response:
         """
         Register a new Service Hook
         ```````````````````````````
@@ -100,22 +84,25 @@ class ProjectServiceHooksEndpoint(ProjectEndpoint):
         This endpoint requires the 'servicehooks' feature to
         be enabled for your project.
 
-        :pparam string organization_slug: the slug of the organization the
+        :pparam string organization_id_or_slug: the id or slug of the organization the
                                           client keys belong to.
-        :pparam string project_slug: the slug of the project the client keys
+        :pparam string project_id_or_slug: the id or slug of the project the client keys
                                      belong to.
         :param string url: the url for the webhook
         :param array[string] events: the events to subscribe to
         :auth: required
         """
-        if not request.user.is_authenticated():
+        if not request.user.is_authenticated:
             return self.respond(status=401)
 
         if not self.has_feature(request, project):
-            return self.respond({
-                'error_type': 'unavailable_feature',
-                'detail': ['You do not have that feature enabled']
-            }, status=403)
+            return self.respond(
+                {
+                    "error_type": "unavailable_feature",
+                    "detail": ["You do not have that feature enabled"],
+                },
+                status=403,
+            )
 
         validator = ServiceHookValidator(data=request.data)
         if not validator.is_valid():
@@ -123,22 +110,27 @@ class ProjectServiceHooksEndpoint(ProjectEndpoint):
 
         result = validator.validated_data
 
-        with transaction.atomic():
-            hook = service_hooks.Creator.run(
-                projects=[project],
-                organization=project.organization,
-                url=result['url'],
-                actor=request.user,
-                events=result.get('events'),
-                application=getattr(request.auth, 'application', None) if request.auth else None,
-            )
+        app_id: int | None = getattr(request.auth, "application_id", None)
 
-            self.create_audit_entry(
-                request=request,
-                organization=project.organization,
-                target_object=hook.id,
-                event=AuditLogEntryEvent.SERVICEHOOK_ADD,
-                data=hook.get_audit_log_data(),
-            )
+        hook = hook_service.create_service_hook(
+            project_ids=[project.id],
+            organization_id=project.organization.id,
+            url=result["url"],
+            actor_id=request.user.id,
+            events=result.get("events"),
+            application_id=app_id,
+            installation_id=None,  # Just being explicit here.
+        )
 
-        return self.respond(serialize(hook, request.user), status=201)
+        self.create_audit_entry(
+            request=request,
+            organization=project.organization,
+            target_object=hook.id,
+            event=audit_log.get_event_id("SERVICEHOOK_ADD"),
+            data=hook.get_audit_log_data(),
+        )
+
+        return self.respond(
+            serialize(ServiceHook.objects.get(id=hook.id), request.user, ServiceHookSerializer()),
+            status=201,
+        )

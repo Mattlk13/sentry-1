@@ -1,42 +1,41 @@
-from __future__ import absolute_import
+from __future__ import annotations
 
-
-from collections import OrderedDict
 import logging
-import six
+from collections.abc import Mapping
+from html import escape
+from typing import Any, ClassVar, Union
 
 from django.conf import settings
-from django.utils.translation import ugettext as _
+from django.utils.functional import classproperty
+from django.utils.translation import gettext as _
 
-from sentry.utils.canonical import get_canonical_name
-from sentry.utils.html import escape
 from sentry.utils.imports import import_string
-from sentry.utils.safe import safe_execute
-from sentry.utils.decorators import classproperty
-
+from sentry.utils.json import prune_empty_keys
+from sentry.utils.safe import get_path, safe_execute
 
 logger = logging.getLogger("sentry.events")
 interface_logger = logging.getLogger("sentry.interfaces")
 
+DataPath = list[Union[str, int]]
 
-def get_interface(name):
+
+def get_interface(name: str) -> type[Interface]:
     try:
-        name = get_canonical_name(name)
         import_path = settings.SENTRY_INTERFACES[name]
     except KeyError:
-        raise ValueError('Invalid interface name: %s' % (name, ))
+        raise ValueError(f"Invalid interface name: {name}")
 
     try:
         interface = import_string(import_path)
     except Exception:
-        raise ValueError('Unable to load interface: %s' % (name, ))
+        raise ValueError(f"Unable to load interface: {name}")
 
     return interface
 
 
-def get_interfaces(data):
+def get_interfaces(event: Mapping[str, Any]) -> dict[str, Interface]:
     result = []
-    for key, data in six.iteritems(data):
+    for key, data in event.items():
         # Skip invalid interfaces that were nulled out during normalization
         if data is None:
             continue
@@ -46,49 +45,30 @@ def get_interfaces(data):
         except ValueError:
             continue
 
-        value = safe_execute(cls.to_python, data, _with_transaction=False)
+        value = safe_execute(cls.to_python, data, datapath=[key])
         if not value:
             continue
 
         result.append((key, value))
 
-    return OrderedDict(
-        (k, v) for k, v in sorted(result, key=lambda x: x[1].get_score(), reverse=True)
-    )
-
-
-def prune_empty_keys(obj):
-    if obj is None:
-        return None
-
-    # eliminate None values for serialization to compress the keyspace
-    # and save (seriously) ridiculous amounts of bytes
-    #
-    # Do not coerce empty arrays/dicts or other "falsy" values here to None,
-    # but rather deal with them case-by-case before calling `prune_empty_keys`
-    # (e.g. in `Interface.to_json`). Rarely, but sometimes, there's a slight
-    # semantic difference between empty containers and a missing value. One
-    # example would be `event.logentry.formatted`, where `{}` means "this
-    # message has no params" and `None` means "this message is already
-    # formatted".
-    return dict((k, v) for k, v in six.iteritems(obj) if v is not None)
+    return {k: v for k, v in sorted(result, key=lambda x: x[1].get_score(), reverse=True)}
 
 
 class InterfaceValidationError(Exception):
     pass
 
 
-class Interface(object):
+class Interface:
     """
     An interface is a structured representation of data, which may
     render differently than the default ``extra`` metadata in an event.
     """
 
-    _data = None
     score = 0
-    display_score = None
+    display_score: ClassVar[int | None] = None
     ephemeral = False
-    grouping_variants = ['default']
+    grouping_variants = ["default"]
+    datapath = None
 
     def __init__(self, **data):
         self._data = data or {}
@@ -111,31 +91,44 @@ class Interface(object):
         return self._data == other._data
 
     def __getstate__(self):
-        return {'_data': self._data}
+        return {"_data": self._data}
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        if not hasattr(self, '_data'):
+        if not hasattr(self, "_data"):
             self._data = {}
 
     def __getattr__(self, name):
         return self._data[name]
 
     def __setattr__(self, name, value):
-        if name == '_data':
-            self.__dict__['_data'] = value
+        if name == "_data":
+            self.__dict__["_data"] = value
         else:
             self._data[name] = value
 
     @classmethod
-    def to_python(cls, data):
+    def to_python(cls, data, datapath: DataPath | None = None):
         """Creates a python interface object from the given raw data.
 
         This function can assume fully normalized and valid data. It can create
         defaults where data is missing but does not need to handle interface
         validation.
         """
-        return cls(**data) if data is not None else None
+        if data is None:
+            return None
+
+        rv = cls(**data)
+        object.__setattr__(rv, "datapath", datapath)
+        return rv
+
+    @classmethod
+    def to_python_subpath(cls, data, path: DataPath, datapath: DataPath | None = None):
+        if data is None:
+            return None
+
+        subdata = get_path(data, *path)
+        return cls.to_python(subdata, datapath=datapath + path if datapath else None)
 
     def get_raw_data(self):
         """Returns the underlying raw data."""
@@ -153,38 +146,20 @@ class Interface(object):
     def get_title(self):
         return _(type(self).__name__)
 
-    def get_display_score(self):
+    def get_display_score(self) -> int:
         return self.display_score or self.score
 
-    def get_score(self):
+    def get_score(self) -> int:
         return self.score
 
     def iter_tags(self):
         return iter(())
 
-    def to_string(self, event, is_public=False, **kwargs):
-        return ''
+    def to_string(self, event) -> str:
+        return ""
 
     def to_email_html(self, event, **kwargs):
         body = self.to_string(event)
         if not body:
-            return ''
-        return '<pre>%s</pre>' % (escape(body), )
-
-    # deprecated stuff.  These were deprecated in late 2018, once
-    # determined they are unused we can kill them.
-
-    def get_path(self):
-        from warnings import warn
-        warn(DeprecationWarning('Replaced with .path'))
-        return self.path
-
-    def get_alias(self):
-        from warnings import warn
-        warn(DeprecationWarning('Replaced with .path'))
-        return self.path
-
-    def get_slug(self):
-        from warnings import warn
-        warn(DeprecationWarning('Replaced with .path'))
-        return self.path
+            return ""
+        return f"<pre>{escape(body)}</pre>"

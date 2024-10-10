@@ -1,33 +1,31 @@
-from __future__ import absolute_import
-
 from sentry import analytics
 
 
 class BaseIncidentEvent(analytics.Event):
-    attributes = (
-        analytics.Attribute('incident_id'),
-        analytics.Attribute('organization_id'),
-        analytics.Attribute('incident_type'),
+    attributes: tuple[analytics.Attribute, ...] = (
+        analytics.Attribute("incident_id"),
+        analytics.Attribute("organization_id"),
+        analytics.Attribute("incident_type"),
     )
 
 
 class IncidentCreatedEvent(BaseIncidentEvent):
-    type = 'incident.created'
+    type = "incident.created"
 
 
 class IncidentStatusUpdatedEvent(BaseIncidentEvent):
-    type = 'incident.status_change'
+    type = "incident.status_change"
     attributes = BaseIncidentEvent.attributes + (
-        analytics.Attribute('prev_status'),
-        analytics.Attribute('status'),
+        analytics.Attribute("prev_status"),
+        analytics.Attribute("status"),
     )
 
 
 class IncidentCommentCreatedEvent(BaseIncidentEvent):
-    type = 'incident.comment'
+    type = "incident.comment"
     attributes = BaseIncidentEvent.attributes + (
-        analytics.Attribute('user_id', required=False),
-        analytics.Attribute('activity_id', required=False),
+        analytics.Attribute("user_id", required=False),
+        analytics.Attribute("activity_id", required=False),
     )
 
 

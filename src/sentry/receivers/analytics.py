@@ -1,9 +1,7 @@
-from __future__ import absolute_import
-
 from django.db.models.signals import post_save
 
 from sentry import analytics
-from sentry.models import User
+from sentry.users.models.user import User
 
 
 def capture_signal(type):
@@ -15,8 +13,5 @@ def capture_signal(type):
 
 
 post_save.connect(
-    capture_signal('user.created'),
-    sender=User,
-    dispatch_uid='analytics.user.created',
-    weak=False,
+    capture_signal("user.created"), sender=User, dispatch_uid="analytics.user.created", weak=False
 )

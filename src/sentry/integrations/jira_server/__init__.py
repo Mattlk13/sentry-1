@@ -1,5 +1,11 @@
-from __future__ import absolute_import
+from sentry.rules import rules
 
-from sentry.utils.imports import import_submodules
+from .actions.create_ticket import *  # noqa: F401,F403
+from .actions.create_ticket import JiraServerCreateTicketAction
+from .client import *  # noqa: F401,F403
+from .integration import *  # noqa: F401,F403
+from .search import *  # noqa: F401,F403
+from .urls import *  # noqa: F401,F403
+from .webhooks import *  # noqa: F401,F403
 
-import_submodules(globals(), __name__, __path__)
+rules.add(JiraServerCreateTicketAction)

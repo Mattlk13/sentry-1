@@ -1,4 +1,5 @@
-from __future__ import absolute_import
+from sentry.features.permanent import register_permanent_features
+from sentry.features.temporary import register_temporary_features
 
 from .base import *  # NOQA
 from .handler import *  # NOQA
@@ -8,10 +9,10 @@ from .manager import *  # NOQA
 #
 # Registering a new feature:
 #
-# - Determine what scope your feature falls under. By convention we have a
-#   organizations and project scope which map to the OrganizationFeature and
-#   ProjectFeature feature objects. Scoping will provide the feature with
-#   context.
+# - Determine what scope your feature falls under. By convention we have
+#   organization and project scopes, which map to the OrganizationFeature and
+#   ProjectFeature feature objects, respectively. Scoping will provide the feature
+#   with context.
 #
 #   Organization and Project scoped features will automatically be added into
 #   the Organization and Project serialized representations.
@@ -22,12 +23,17 @@ from .manager import *  # NOQA
 #   NOTE: There is no currently established convention for features which do not
 #         fall under these scopes. Use your best judgment for these.
 #
+# - Decide if your feature needs to be exposed in API responses or not
+#   If your feature is not used in the frontend, it is recommended that you don't
+#   expose the feature flag as feature flag checks add latency and bloat to organization
+#   details and project details responses.
+#
 # - Set a default for your features.
 #
-#   Feature defaults are configured in the sentry.conf.server.SENTRY_FEATURES
-#   module variable. This is the DEFAULT value for a feature, the default may be
-#   overridden by the logic in the exposed feature.manager.FeatureManager
-#   instance. See the ``has`` method here for a detailed understanding of how
+#   Feature defaults are configured with the `default` parameter. Default values
+#   can also be defined in `settings.SENTRY_FEATURES`. Default values
+#   are used if no registered handler makes a decision for the feature.
+#   See the ``has`` method here for a detailed understanding of how
 #   the default values is overridden.
 #
 # - Use your feature.
@@ -42,80 +48,20 @@ from .manager import *  # NOQA
 #
 #   NOTE: The actor kwarg should be passed when it's expected that the handler
 #         needs context of the user.
-#
-#   NOTE: Features that require Snuba to function, add to the
-#         `requires_snuba` tuple.
 
 default_manager = FeatureManager()  # NOQA
 
-# Unscoped features
-default_manager.add('auth:register')
-default_manager.add('organizations:create')
-
-# Organization scoped features
-default_manager.add('organizations:advanced-search', OrganizationFeature)  # NOQA
-default_manager.add('organizations:boolean-search', OrganizationFeature)  # NOQA
-default_manager.add('organizations:api-keys', OrganizationFeature)  # NOQA
-default_manager.add('organizations:discover', OrganizationFeature)  # NOQA
-default_manager.add('organizations:events', OrganizationFeature)  # NOQA
-default_manager.add('organizations:events-v2', OrganizationFeature)  # NOQA
-default_manager.add('organizations:event-attachments', OrganizationFeature)  # NOQA
-default_manager.add('organizations:symbol-sources', OrganizationFeature)  # NOQA
-default_manager.add('organizations:global-views', OrganizationFeature)  # NOQA
-default_manager.add('organizations:incidents', OrganizationFeature)  # NOQA
-default_manager.add('organizations:integrations-issue-basic', OrganizationFeature)  # NOQA
-default_manager.add('organizations:integrations-issue-sync', OrganizationFeature)  # NOQA
-default_manager.add('organizations:integrations-event-hooks', OrganizationFeature)  # NOQA
-default_manager.add('organizations:internal-catchall', OrganizationFeature)  # NOQA
-default_manager.add('organizations:incidents', OrganizationFeature)  # NOQA
-default_manager.add('organizations:sentry-apps', OrganizationFeature)  # NOQA
-default_manager.add('organizations:invite-members', OrganizationFeature)  # NOQA
-default_manager.add('organizations:large-debug-files', OrganizationFeature)  # NOQA
-default_manager.add('organizations:legacy-event-id', OrganizationFeature)  # NOQA
-default_manager.add('organizations:monitors', OrganizationFeature)  # NOQA
-default_manager.add('organizations:onboarding', OrganizationFeature)  # NOQA
-default_manager.add('organizations:org-saved-searches', OrganizationFeature)  # NOQA
-default_manager.add('organizations:relay', OrganizationFeature)  # NOQA
-default_manager.add('organizations:require-2fa', OrganizationFeature)  # NOQA
-default_manager.add('organizations:sentry10', OrganizationFeature)  # NOQA
-default_manager.add('organizations:sso-basic', OrganizationFeature)  # NOQA
-default_manager.add('organizations:sso-rippling', OrganizationFeature)  # NOQA
-default_manager.add('organizations:sso-saml2', OrganizationFeature)  # NOQA
-default_manager.add('organizations:grouping-info', OrganizationFeature)  # NOQA
-default_manager.add('organizations:tweak-grouping-config', OrganizationFeature)  # NOQA
-default_manager.add('organizations:set-grouping-config', OrganizationFeature)  # NOQA
-
-# Project scoped features
-default_manager.add('projects:custom-inbound-filters', ProjectFeature)  # NOQA
-default_manager.add('projects:data-forwarding', ProjectFeature)  # NOQA
-default_manager.add('projects:discard-groups', ProjectFeature)  # NOQA
-default_manager.add('projects:minidump', ProjectFeature)  # NOQA
-default_manager.add('projects:rate-limits', ProjectFeature)  # NOQA
-default_manager.add('projects:sample-events', ProjectFeature)  # NOQA
-default_manager.add('projects:servicehooks', ProjectFeature)  # NOQA
-default_manager.add('projects:similarity-view', ProjectFeature)  # NOQA
-default_manager.add('projects:similarity-indexing', ProjectFeature)  # NOQA
-
-# Project plugin features
-default_manager.add('projects:plugins', ProjectPluginFeature)  # NOQA
-
-# This is a gross hardcoded list, but there's no
-# other sensible way to manage this right now without augmenting
-# features themselves in the manager with detections like this.
-requires_snuba = (
-    'organizations:discover',
-    'organizations:events',
-    'organizations:events-v2',
-    'organizations:global-views',
-    'organizations:incidents',
-    'organizations:sentry10',
-)
-
-# NOTE: Don't add features down here! Add them to their specific group and sort
-#       them alphabetically! The order features are registered is not important.
+register_permanent_features(default_manager)
+register_temporary_features(default_manager)
 
 # expose public api
 add = default_manager.add
+entity_features = default_manager.entity_features
+option_features = default_manager.option_features
 get = default_manager.get
 has = default_manager.has
+batch_has = default_manager.batch_has
 all = default_manager.all
+add_handler = default_manager.add_handler
+add_entity_handler = default_manager.add_entity_handler
+has_for_batch = default_manager.has_for_batch

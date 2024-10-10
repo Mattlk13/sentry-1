@@ -1,92 +1,103 @@
-from __future__ import absolute_import
+from __future__ import annotations
 
-import logging
-import six
+from collections.abc import Mapping, MutableMapping, Sequence
+from typing import Any
 
-from sentry.integrations.exceptions import ApiError, IntegrationError
-from sentry.models import Integration
-from sentry.plugins import providers
+from sentry.constants import ObjectStatus
+from sentry.integrations.base import IntegrationInstallation
+from sentry.integrations.services.integration import integration_service
+from sentry.models.organization import Organization
+from sentry.models.pullrequest import PullRequest
+from sentry.models.repository import Repository
+from sentry.organizations.services.organization.model import RpcOrganization
+from sentry.plugins.providers import IntegrationRepositoryProvider
+from sentry.shared_integrations.exceptions import ApiError, IntegrationError
 
-WEBHOOK_EVENTS = ['push', 'pull_request']
+WEBHOOK_EVENTS = ["push", "pull_request"]
 
 
-class GitHubRepositoryProvider(providers.IntegrationRepositoryProvider):
-    name = 'GitHub'
-    logger = logging.getLogger('sentry.plugins.github')
-    repo_provider = 'github'
+class GitHubRepositoryProvider(IntegrationRepositoryProvider):
+    name = "GitHub"
+    repo_provider = "github"
 
-    def _validate_repo(self, client, installation, repo):
+    def _validate_repo(self, client: Any, installation: IntegrationInstallation, repo: str) -> Any:
         try:
             repo_data = client.get_repo(repo)
         except Exception as e:
-            installation.raise_error(e)
+            raise installation.raise_error(e)
 
         try:
             # make sure installation has access to this specific repo
-            # use hooks endpoint since we explicity ask for those permissions
+            # use hooks endpoint since we explicitly ask for those permissions
             # when installing the app (commits can be accessed for public repos)
-            # https://developer.github.com/v3/repos/hooks/#list-hooks
+            # https://docs.github.com/en/rest/webhooks/repo-config#list-hooks
             client.repo_hooks(repo)
-        except ApiError as e:
-            raise IntegrationError(u'You must grant Sentry access to {}'.format(repo))
+        except ApiError:
+            raise IntegrationError(f"You must grant Sentry access to {repo}")
 
         return repo_data
 
-    def get_repository_data(self, organization, config):
-        integration = Integration.objects.get(
-            id=config['installation'], organizations=organization)
-        installation = integration.get_installation(organization.id)
+    def get_repository_data(
+        self, organization: Organization, config: MutableMapping[str, Any]
+    ) -> Mapping[str, Any]:
+        installation = self.get_installation(config.get("installation"), organization.id)
         client = installation.get_client()
 
-        repo = self._validate_repo(client, installation, config['identifier'])
-        config['external_id'] = six.text_type(repo['id'])
-        config['integration_id'] = integration.id
+        repo = self._validate_repo(client, installation, config["identifier"])
+        config["external_id"] = str(repo["id"])
+        config["integration_id"] = installation.model.id
 
         return config
 
-    def build_repository_config(self, organization, data):
+    def build_repository_config(
+        self, organization: RpcOrganization, data: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
         return {
-            'name': data['identifier'],
-            'external_id': data['external_id'],
-            'url': u'https://github.com/{}'.format(data['identifier']),
-            'config': {
-                'name': data['identifier'],
-            },
-            'integration_id': data['integration_id']
+            "name": data["identifier"],
+            "external_id": data["external_id"],
+            "url": "https://github.com/{}".format(data["identifier"]),
+            "config": {"name": data["identifier"]},
+            "integration_id": data["integration_id"],
         }
 
-    def compare_commits(self, repo, start_sha, end_sha):
-        def eval_commits(client):
+    def compare_commits(
+        self, repo: Repository, start_sha: str | None, end_sha: str
+    ) -> Sequence[Mapping[str, Any]]:
+        def eval_commits(client: Any) -> Sequence[Mapping[str, Any]]:
             # use config name because that is kept in sync via webhooks
-            name = repo.config['name']
+            name = repo.config["name"]
             if start_sha is None:
                 res = client.get_last_commits(name, end_sha)
                 return self._format_commits(client, name, res[:20])
             else:
                 res = client.compare_commits(name, start_sha, end_sha)
-                return self._format_commits(client, name, res['commits'])
+                return self._format_commits(client, name, res["commits"])
 
         integration_id = repo.integration_id
         if integration_id is None:
-            raise NotImplementedError('GitHub apps requires an integration id to fetch commits')
-        integration = Integration.objects.get(id=integration_id)
-        installation = integration.get_installation(repo.organization_id)
+            raise NotImplementedError("GitHub apps requires an integration id to fetch commits")
+        integration = integration_service.get_integration(
+            integration_id=integration_id, status=ObjectStatus.ACTIVE
+        )
+        if integration is None:
+            raise NotImplementedError(
+                "GitHub apps requires a valid active integration to fetch commits"
+            )
+
+        installation = integration.get_installation(organization_id=repo.organization_id)
         client = installation.get_client()
 
         try:
             return eval_commits(client)
-        except ApiError as e:
-            if e.code == 404:
-                try:
-                    client.get_token(force_refresh=True)
-                    return eval_commits(client)
-                except Exception as e:
-                    installation.raise_error(e)
-            installation.raise_error(e)
         except Exception as e:
             installation.raise_error(e)
 
-    def _format_commits(self, client, repo_name, commit_list):
+    def _format_commits(
+        self,
+        client: Any,
+        repo_name: str,
+        commit_list: Any,
+    ) -> Sequence[Mapping[str, Any]]:
         """Convert GitHub commits into our internal format
 
         For each commit in the list we have to fetch patch data, as the
@@ -98,57 +109,42 @@ class GitHubRepositoryProvider(providers.IntegrationRepositoryProvider):
         """
         return [
             {
-                'id': c['sha'],
-                'repository': repo_name,
-                'author_email': c['commit']['author'].get('email'),
-                'author_name': c['commit']['author'].get('name'),
-                'message': c['commit']['message'],
-                'timestamp': self.format_date(c['commit']['author'].get('date')),
-                'patch_set': self._get_patchset(client, repo_name, c['sha'])
-            } for c in commit_list
+                "id": c["sha"],
+                "repository": repo_name,
+                "author_email": c["commit"]["author"].get("email"),
+                "author_name": c["commit"]["author"].get("name"),
+                "message": c["commit"]["message"],
+                "timestamp": self.format_date(c["commit"]["author"].get("date")),
+                "patch_set": self._get_patchset(client, repo_name, c["sha"]),
+            }
+            for c in commit_list
         ]
 
-    def _get_patchset(self, client, repo_name, sha):
-        """Get the modified files for a commit
-        """
+    def _get_patchset(self, client: Any, repo_name: str, sha: str) -> Sequence[Mapping[str, Any]]:
+        """Get the modified files for a commit"""
         commit = client.get_commit(repo_name, sha)
-        return self._transform_patchset(commit['files'])
+        return self._transform_patchset(commit["files"])
 
-    def _transform_patchset(self, diff):
+    def _transform_patchset(self, diff: Sequence[Mapping[str, Any]]) -> Sequence[Mapping[str, Any]]:
         """Convert the patch data from GitHub into our internal format
 
         See sentry.models.Release.set_commits
         """
         changes = []
         for change in diff:
-            if change['status'] == 'modified':
-                changes.append({
-                    'path': change['filename'],
-                    'type': 'M',
-                })
-            if change['status'] == 'added':
-                changes.append({
-                    'path': change['filename'],
-                    'type': 'A',
-                })
-            if change['status'] == 'removed':
-                changes.append({
-                    'path': change['filename'],
-                    'type': 'D',
-                })
-            if change['status'] == 'renamed':
-                changes.append({
-                    'path': change['previous_filename'],
-                    'type': 'D',
-                })
-                changes.append({
-                    'path': change['filename'],
-                    'type': 'A',
-                })
+            if change["status"] == "modified":
+                changes.append({"path": change["filename"], "type": "M"})
+            if change["status"] == "added":
+                changes.append({"path": change["filename"], "type": "A"})
+            if change["status"] == "removed":
+                changes.append({"path": change["filename"], "type": "D"})
+            if change["status"] == "renamed":
+                changes.append({"path": change["previous_filename"], "type": "D"})
+                changes.append({"path": change["filename"], "type": "A"})
         return changes
 
-    def pull_request_url(self, repo, pull_request):
-        return u'{}/pull/{}'.format(repo.url, pull_request.key)
+    def pull_request_url(self, repo: Repository, pull_request: PullRequest) -> str:
+        return f"{repo.url}/pull/{pull_request.key}"
 
-    def repository_external_slug(self, repo):
+    def repository_external_slug(self, repo: Repository) -> str:
         return repo.name

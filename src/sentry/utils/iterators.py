@@ -1,30 +1,34 @@
-from __future__ import absolute_import
-
 import itertools
+from collections.abc import Generator, Iterable
+from typing import TypeVar
+
+T = TypeVar("T")
 
 
-def advance(n, iterator):
+def advance(n: int, iterator: Iterable[T]) -> Iterable[T]:
     """Advances an iterator n places."""
     next(itertools.islice(iterator, n, n), None)
     return iterator
 
 
-def shingle(n, iterator):
+def shingle(n: int, iterator: Iterable[T]) -> list[tuple[T, ...]]:
     """\
     Shingle a token stream into N-grams.
 
     >>> list(shingle(2, ('foo', 'bar', 'baz')))
     [('foo', 'bar'), ('bar', 'baz')]
     """
-    return itertools.izip(
-        *map(
-            lambda i__iterator: advance(i__iterator[0], i__iterator[1]),
-            enumerate(itertools.tee(iterator, n)),
+    return list(
+        zip(
+            *map(
+                lambda i__iterator: advance(i__iterator[0], i__iterator[1]),
+                enumerate(itertools.tee(iterator, n)),
+            )
         )
     )
 
 
-def chunked(iterator, size):
+def chunked(iterator: Iterable[T], size: int) -> Generator[list[T], None, None]:
     chunk = []
     for item in iterator:
         chunk.append(item)

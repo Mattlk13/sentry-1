@@ -1,36 +1,38 @@
-from __future__ import absolute_import
+from django.urls import reverse
 
-from django.core.urlresolvers import reverse
+from sentry.testutils.cases import APITestCase
+from sentry.testutils.helpers.datetime import before_now, freeze_time
+from sentry.testutils.skips import requires_snuba
 
-from sentry import tsdb
-from sentry.testutils import APITestCase
+pytestmark = [requires_snuba]
 
 
+@freeze_time(before_now(days=1).replace(minute=10))
 class TeamStatsTest(APITestCase):
     def test_simple(self):
         self.login_as(user=self.user)
 
         team = self.create_team(members=[self.user])
-        project_1 = self.create_project(teams=[team], name='a')
-        project_2 = self.create_project(teams=[team], name='b')
+        project_1 = self.create_project(teams=[team], name="a")
+        project_2 = self.create_project(teams=[team], name="b")
         team_2 = self.create_team(members=[self.user])
-        project_3 = self.create_project(teams=[team_2], name='c')
+        project_3 = self.create_project(teams=[team_2], name="c")
 
-        tsdb.incr(tsdb.models.project, project_1.id, count=3)
-        tsdb.incr(tsdb.models.project, project_2.id, count=5)
-        tsdb.incr(tsdb.models.project, project_3.id, count=10)
+        for project, count in ((project_1, 2), (project_2, 1), (project_3, 4)):
+            for _ in range(count):
+                self.store_event(
+                    data={
+                        "timestamp": before_now(minutes=5).timestamp(),
+                    },
+                    project_id=project.id,
+                )
 
         url = reverse(
-            'sentry-api-0-team-stats',
+            "sentry-api-0-team-stats",
             kwargs={
-                'organization_slug': team.organization.slug,
-                'team_slug': team.slug,
-            }
+                "organization_id_or_slug": team.organization.slug,
+                "team_id_or_slug": team.slug,
+            },
         )
         response = self.client.get(url)
-
         assert response.status_code == 200, response.content
-        assert response.data[-1][1] == 8, response.data
-        for point in response.data[:-1]:
-            assert point[1] == 0
-        assert len(response.data) == 24

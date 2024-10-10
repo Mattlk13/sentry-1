@@ -1,30 +1,26 @@
-from __future__ import absolute_import
-
-import six
-
 from sentry.api.serializers import Serializer, register, serialize
-from sentry.models import ApiAuthorization
+from sentry.models.apiauthorization import ApiAuthorization
 
 
 @register(ApiAuthorization)
 class ApiAuthorizationSerializer(Serializer):
-    def get_attrs(self, item_list, user):
+    def get_attrs(self, item_list, user, **kwargs):
         apps = {
-            d['id']: d
-            for d in serialize(set(i.application for i in item_list if i.application_id), user)
+            d["id"]: d
+            for d in serialize({i.application for i in item_list if i.application_id}, user)
         }
 
         attrs = {}
         for item in item_list:
             attrs[item] = {
-                'application': (apps.get(item.application.client_id) if item.application else None),
+                "application": (apps.get(item.application.client_id) if item.application else None)
             }
         return attrs
 
-    def serialize(self, obj, attrs, user):
+    def serialize(self, obj, attrs, user, **kwargs):
         return {
-            'id': six.text_type(obj.id),
-            'scopes': obj.get_scopes(),
-            'application': attrs['application'],
-            'dateCreated': obj.date_added,
+            "id": str(obj.id),
+            "scopes": obj.get_scopes(),
+            "application": attrs["application"],
+            "dateCreated": obj.date_added,
         }

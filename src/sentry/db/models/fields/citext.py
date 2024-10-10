@@ -1,60 +1,47 @@
-from __future__ import absolute_import, print_function
+from __future__ import annotations
 
-import six
-
-from django.conf import settings
 from django.db import connections, models
+from django.db.backends.base.base import BaseDatabaseWrapper
+from django.db.models import Model
 from django.db.models.signals import pre_migrate
 
+from sentry.db.models.utils import Creator
 
-__all__ = ('CITextField', 'CICharField', 'CIEmailField')
-
-
-class CIText(object):
-    def db_type(self, connection):
-        engine = connection.settings_dict['ENGINE']
-        if 'postgres' in engine:
-            return 'citext'
-        return super(CIText, self).db_type(connection)
+__all__ = ("CITextField", "CICharField", "CIEmailField")
 
 
-class CITextField(CIText, models.TextField):
-    pass
+class CIText:
+    def db_type(self, connection: BaseDatabaseWrapper) -> str:
+        return "citext"
 
 
-class CICharField(CIText, models.CharField):
-    pass
+class CITextField(CIText, models.TextField[str, str]):
+    def contribute_to_class(self, cls: type[Model], name: str, private_only: bool = False) -> None:
+        super().contribute_to_class(cls, name, private_only=private_only)
+        setattr(cls, name, Creator(self))
 
 
-class CIEmailField(CIText, models.EmailField):
-    pass
+class CICharField(CIText, models.CharField[str, str]):
+    def contribute_to_class(self, cls: type[Model], name: str, private_only: bool = False) -> None:
+        super().contribute_to_class(cls, name, private_only=private_only)
+        setattr(cls, name, Creator(self))
 
 
-if hasattr(models, 'SubfieldBase'):
-    CITextField = six.add_metaclass(models.SubfieldBase)(CITextField)
-    CICharField = six.add_metaclass(models.SubfieldBase)(CICharField)
-    CIEmailField = six.add_metaclass(models.SubfieldBase)(CIEmailField)
-
-if 'south' in settings.INSTALLED_APPS:
-    from south.modelsinspector import add_introspection_rules
-
-    add_introspection_rules([], ["^sentry\.db\.models\.fields\.citext\.CITextField"])
-    add_introspection_rules([], ["^sentry\.db\.models\.fields\.citext\.CICharField"])
-    add_introspection_rules([], ["^sentry\.db\.models\.fields\.citext\.CIEmailField"])
+class CIEmailField(CIText, models.EmailField[str, str]):
+    def contribute_to_class(self, cls: type[Model], name: str, private_only: bool = False) -> None:
+        super().contribute_to_class(cls, name, private_only=private_only)
+        setattr(cls, name, Creator(self))
 
 
-def create_citext_extension(using, **kwargs):
-    from sentry.utils.db import is_postgres
-
+def create_citext_extension(using: str, **kwargs: object) -> None:
     # We always need the citext extension installed for Postgres,
     # and for tests, it's not always guaranteed that we will have
     # run full migrations which installed it.
-    if is_postgres(using):
-        cursor = connections[using].cursor()
-        try:
-            cursor.execute('CREATE EXTENSION IF NOT EXISTS citext')
-        except Exception:
-            pass
+    cursor = connections[using].cursor()
+    try:
+        cursor.execute("CREATE EXTENSION IF NOT EXISTS citext")
+    except Exception:
+        pass
 
 
 pre_migrate.connect(create_citext_extension)

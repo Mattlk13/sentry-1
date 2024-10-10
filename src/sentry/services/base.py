@@ -1,8 +1,5 @@
-from __future__ import absolute_import, print_function
+class Service:
+    name = ""
 
-
-class Service(object):
-    name = ''
-
-    def __init__(self, debug=False):
+    def __init__(self, debug: bool = False) -> None:
         self.debug = debug

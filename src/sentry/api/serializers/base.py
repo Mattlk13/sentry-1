@@ -1,11 +1,46 @@
-from __future__ import absolute_import
+from __future__ import annotations
 
+import logging
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
+from typing import Any, TypeVar
+
+import sentry_sdk
 from django.contrib.auth.models import AnonymousUser
 
-registry = {}
+logger = logging.getLogger(__name__)
+
+K = TypeVar("K")
+
+registry: MutableMapping[Any, Any] = {}
 
 
-def serialize(objects, user=None, serializer=None, **kwargs):
+def register(type: Any) -> Callable[[type[K]], type[K]]:
+    """A wrapper that adds the wrapped Serializer to the Serializer registry (see above) for the key `type`."""
+
+    def wrapped(cls: type[K]) -> type[K]:
+        registry[type] = cls()
+        return cls
+
+    return wrapped
+
+
+def serialize(
+    objects: Any | Sequence[Any],
+    user: Any | None = None,
+    serializer: Any | None = None,
+    **kwargs: Any,
+) -> Any:
+    """
+    Turn a model (or list of models) into a python object made entirely of primitives.
+
+    :param objects: A list of objects
+    :param user: The user who will be viewing the objects. Omit to view as `AnonymousUser`.
+    :param serializer: The `Serializer` class whose logic we'll use to serialize
+        `objects` (see below.) Omit to just look up the Serializer in the
+        registry by the `objects`'s type.
+    :param kwargs Any
+    :returns A list of the serialized versions of `objects`.
+    """
     if user is None:
         user = AnonymousUser()
 
@@ -26,34 +61,65 @@ def serialize(objects, user=None, serializer=None, **kwargs):
                 pass
         else:
             return objects
+    with sentry_sdk.start_span(op="serialize", name=type(serializer).__name__) as span:
+        span.set_data("Object Count", len(objects))
 
-    attrs = serializer.get_attrs(
-        # avoid passing NoneType's to the serializer as they're allowed and
-        # filtered out of serialize()
-        item_list=[o for o in objects if o is not None],
-        user=user,
-        **kwargs
-    )
+        with sentry_sdk.start_span(op="serialize.get_attrs", name=type(serializer).__name__):
+            attrs = serializer.get_attrs(
+                # avoid passing NoneType's to the serializer as they're allowed and
+                # filtered out of serialize()
+                item_list=[o for o in objects if o is not None],
+                user=user,
+                **kwargs,
+            )
 
-    return [serializer(o, attrs=attrs.get(o, {}), user=user, **kwargs) for o in objects]
-
-
-def register(type):
-    def wrapped(cls):
-        registry[type] = cls()
-        return cls
-
-    return wrapped
+        with sentry_sdk.start_span(op="serialize.iterate", name=type(serializer).__name__):
+            return [serializer(o, attrs=attrs.get(o, {}), user=user, **kwargs) for o in objects]
 
 
-class Serializer(object):
-    def __call__(self, obj, attrs, user, **kwargs):
+class Serializer:
+    """A Serializer class contains the logic to serialize a specific type of object."""
+
+    def __call__(
+        self, obj: Any, attrs: Mapping[Any, Any], user: Any, **kwargs: Any
+    ) -> Mapping[str, Any] | None:
+        """See documentation for `serialize`."""
         if obj is None:
-            return
-        return self.serialize(obj, attrs, user, **kwargs)
+            return None
+        return self._serialize(obj, attrs, user, **kwargs)
 
-    def get_attrs(self, item_list, user, **kwargs):
+    def get_attrs(
+        self, item_list: Sequence[Any], user: Any, **kwargs: Any
+    ) -> MutableMapping[Any, Any]:
+        """
+        Fetch all of the associated data needed to serialize the objects in `item_list`.
+
+        :param item_list: List of input objects that should be serialized.
+        :param user: The user who will be viewing the objects.
+        :param kwargs: Any
+        :returns A mapping of items from the `item_list` to an Object.
+        """
         return {}
 
-    def serialize(self, obj, attrs, user, **kwargs):
+    def _serialize(
+        self, obj: Any, attrs: Mapping[Any, Any], user: Any, **kwargs: Any
+    ) -> Mapping[str, Any] | None:
+        try:
+            return self.serialize(obj, attrs, user, **kwargs)
+        except Exception:
+            logger.exception("Failed to serialize", extra={"instance": obj})
+            return None
+
+    def serialize(
+        self, obj: Any, attrs: Mapping[Any, Any], user: Any, **kwargs: Any
+    ) -> Mapping[str, Any]:
+        """
+        Convert an arbitrary python object `obj` to an object that only contains primitives.
+
+        :param obj: An item from `item_list` that was passed to `get_attrs`.
+        :param attrs: The object in `get_attrs` that corresponds to `obj`.
+        :param user: The user who will be viewing the objects.
+        :param kwargs: Any
+        :returns A serialized version of `obj`.
+        """
         return {}

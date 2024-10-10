@@ -1,18 +1,19 @@
-from __future__ import absolute_import
-
 from django.db import models
 from django.utils import timezone
 
-from sentry.db.models import (Model, BoundedBigIntegerField, sane_repr)
+from sentry.backup.scopes import RelocationScope
+from sentry.db.models import BoundedBigIntegerField, Model, region_silo_model, sane_repr
 
 
+@region_silo_model
 class ProjectPlatform(Model):
     """
     Tracks usage of a platform for a given project.
 
     Note: This model is used solely for analytics.
     """
-    __core__ = False
+
+    __relocation_scope__ = RelocationScope.Excluded
 
     project_id = BoundedBigIntegerField()
     platform = models.CharField(max_length=64)
@@ -20,8 +21,8 @@ class ProjectPlatform(Model):
     last_seen = models.DateTimeField(default=timezone.now)
 
     class Meta:
-        app_label = 'sentry'
-        db_table = 'sentry_projectplatform'
-        unique_together = (('project_id', 'platform'), )
+        app_label = "sentry"
+        db_table = "sentry_projectplatform"
+        unique_together = (("project_id", "platform"),)
 
-    __repr__ = sane_repr('project_id', 'platform')
+    __repr__ = sane_repr("project_id", "platform")

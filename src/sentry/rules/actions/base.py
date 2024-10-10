@@ -1,12 +1,44 @@
-from __future__ import absolute_import, print_function
+from __future__ import annotations
 
-from sentry.rules.base import RuleBase
+import abc
+import logging
+from collections.abc import Generator
+from typing import Any
+
+from sentry.eventstore.models import GroupEvent
+from sentry.models.rule import Rule
+from sentry.models.rulefirehistory import RuleFireHistory
+from sentry.rules.base import CallbackFuture, RuleBase
+
+logger = logging.getLogger("sentry.rules")
 
 
-class EventAction(RuleBase):
-    rule_type = 'action/event'
+def instantiate_action(rule: Rule, action, rule_fire_history: RuleFireHistory | None = None):
+    from sentry.rules import rules
 
-    def after(self, event, state):
+    action_id = action["id"]
+    action_cls = rules.get(action_id)
+    if action_cls is None:
+        logger.warning("Unregistered action %r", action["id"])
+        return None
+
+    action_inst = action_cls(
+        rule.project, data=action, rule=rule, rule_fire_history=rule_fire_history
+    )
+    if not isinstance(action_inst, EventAction):
+        logger.warning("Unregistered action %r", action["id"])
+        return None
+
+    return action_inst
+
+
+class EventAction(RuleBase, abc.ABC):
+    rule_type = "action/event"
+
+    @abc.abstractmethod
+    def after(
+        self, event: GroupEvent, notification_uuid: str | None = None
+    ) -> Generator[CallbackFuture]:
         """
         Executed after a Rule matches.
 
@@ -15,7 +47,8 @@ class EventAction(RuleBase):
 
         See the notification implementation for example usage.
 
-        >>> def after(self, event, state):
+
+        >>> def after(self, state):
         >>>     yield self.future(self.print_results)
         >>>
         >>> def print_results(self, event, futures):
@@ -23,4 +56,9 @@ class EventAction(RuleBase):
         >>>     for future in futures:
         >>>         print(future)
         """
-        raise NotImplementedError
+
+    def send_confirmation_notification(self, rule: Rule, new: bool, changed: dict[str, Any]):
+        """
+        Send a notification confirming that a rule was created or edited
+        """
+        pass

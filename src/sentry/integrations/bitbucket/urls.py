@@ -1,21 +1,35 @@
-from __future__ import absolute_import
-
-from django.conf.urls import patterns, url
+from django.urls import re_path
 
 from .descriptor import BitbucketDescriptorEndpoint
 from .installed import BitbucketInstalledEndpoint
+from .search import BitbucketSearchEndpoint
 from .uninstalled import BitbucketUninstalledEndpoint
 from .webhook import BitbucketWebhookEndpoint
-from .search import BitbucketSearchEndpoint
-urlpatterns = patterns(
-    '',
-    url(r'^descriptor/$', BitbucketDescriptorEndpoint.as_view()),
-    url(r'^installed/$', BitbucketInstalledEndpoint.as_view()),
-    url(r'^uninstalled/$', BitbucketUninstalledEndpoint.as_view()),
-    url(r'^organizations/(?P<organization_id>[^\/]+)/webhook/$',
-        BitbucketWebhookEndpoint.as_view()),
-    url(r'^search/(?P<organization_slug>[^\/]+)/(?P<integration_id>\d+)/$',
+
+urlpatterns = [
+    re_path(
+        r"^descriptor/$",
+        BitbucketDescriptorEndpoint.as_view(),
+        name="sentry-extensions-bitbucket-descriptor",
+    ),
+    re_path(
+        r"^installed/$",
+        BitbucketInstalledEndpoint.as_view(),
+        name="sentry-extensions-bitbucket-installed",
+    ),
+    re_path(
+        r"^uninstalled/$",
+        BitbucketUninstalledEndpoint.as_view(),
+        name="sentry-extensions-bitbucket-uninstalled",
+    ),
+    re_path(
+        r"^organizations/(?P<organization_id>[^\/]+)/webhook/$",
+        BitbucketWebhookEndpoint.as_view(),
+        name="sentry-extensions-bitbucket-webhook",
+    ),
+    re_path(
+        r"^search/(?P<organization_id_or_slug>[^\/]+)/(?P<integration_id>\d+)/$",
         BitbucketSearchEndpoint.as_view(),
-        name='sentry-extensions-bitbucket-search'
-        ),
-)
+        name="sentry-extensions-bitbucket-search",
+    ),
+]

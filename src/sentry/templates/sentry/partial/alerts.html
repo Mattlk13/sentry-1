@@ -1,24 +1,69 @@
 {% load sentry_helpers %}
+{% load sentry_assets %}
+
+{% block css %}
+{% if show_login_banner %}
+<style type="text/css">
+  .alert-banner {
+    background: rgb(255, 219, 74);
+    padding-top: 0.75rem;
+    padding-bottom: 0.75rem;
+    display: flex;
+    justify-content: center;
+    border-radius: 4px;
+    margin-bottom: 4px;
+  }
+  .alert-message {
+    margin-left: 1rem;
+    margin-right: 1rem;
+    line-height: 1.5;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-align: left;
+    flex-grow: 1;
+    font-size: 16px;
+    font-family: Rubik;
+  }
+  @media only screen and (max-width: 1025px) {
+    .alert-banner {
+      display: none;
+    }
+  }
+</style>
+{% endif %}
+{% endblock %}
+
 <div id="blk_alerts" class="messages-container"></div>
-<script>
-$(function(){
-  ReactDOM.render(React.createFactory(SentryApp.Alerts)({
-     className: "alert-list"
-  }), document.getElementById('blk_alerts'));
-});
-</script>
 <div id="blk_indicators"></div>
+
+{% script %}
 <script>
-$(function(){
-  ReactDOM.render(React.createFactory(SentryApp.Indicators)({
-     className: "indicators-container"
-  }), document.getElementById('blk_indicators'));
-});
+  window.__onSentryInit = window.__onSentryInit || [];
+  window.__onSentryInit.push({
+    name: 'renderReact',
+    component: 'SystemAlerts',
+    container: '#blk_alerts',
+    props: {
+      className: 'alert-list',
+    },
+  });
+  window.__onSentryInit.push({
+    name: 'renderReact ',
+    component: 'Indicators',
+    container: '#blk_indicators',
+    props: {
+      className: 'indicators-container',
+    },
+  });
 </script>
+{% endscript %}
+
+
 {% if messages %}
   <div id="messages" class="messages-container">
     {% for message in messages %}
-    	{% with message.tags|split:" " as message_tags %}
+        {% with message.tags|split:" " as message_tags %}
           <div class="alert{% if message.tags %}{% for tag in message_tags %} alert-{{ tag }}{% endfor %}{% endif %}">
             <div class="container">
               <a class="close" data-dismiss="alert">×</a>
@@ -28,5 +73,15 @@ $(function(){
           </div>
       {% endwith %}
     {% endfor %}
+  </div>
+{% elif show_login_banner %}
+  <div class="alert-banner">
+    <div class="alert-message">
+      {% if banner_choice == 0 %}
+      Want to connect with the folks building Sentry? &nbsp<a target="_blank" href="https://discord.com/invite/sentry">Join us on Discord.</a>
+      {% elif banner_choice == 1 %}
+      Want to connect with the folks building Sentry? &nbsp<a target="_blank" href="https://discord.com/invite/sentry">Join us on Discord.</a>
+      {% endif %}
+    </div>
   </div>
 {% endif %}

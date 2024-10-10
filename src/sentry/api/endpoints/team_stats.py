@@ -1,28 +1,25 @@
-from __future__ import absolute_import
-
+from rest_framework.request import Request
 from rest_framework.response import Response
-from six.moves import range
 
 from sentry import tsdb
-from sentry.api.base import DocSection, EnvironmentMixin, StatsMixin
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import EnvironmentMixin, StatsMixin, region_silo_endpoint
 from sentry.api.bases.team import TeamEndpoint
 from sentry.api.exceptions import ResourceDoesNotExist
-from sentry.models import Environment, Project
-from sentry.utils.apidocs import scenario, attach_scenarios
+from sentry.models.environment import Environment
+from sentry.models.project import Project
+from sentry.tsdb.base import TSDBModel
 
 
-@scenario('RetrieveEventCountsTeam')
-def retrieve_event_counts_team(runner):
-    runner.request(
-        method='GET', path='/teams/%s/%s/stats/' % (runner.org.slug, runner.default_team.slug)
-    )
-
-
+@region_silo_endpoint
 class TeamStatsEndpoint(TeamEndpoint, EnvironmentMixin, StatsMixin):
-    doc_section = DocSection.TEAMS
+    publish_status = {
+        "GET": ApiPublishStatus.PRIVATE,
+    }
+    owner = ApiOwner.ENTERPRISE
 
-    @attach_scenarios([retrieve_event_counts_team])
-    def get(self, request, team):
+    def get(self, request: Request, team) -> Response:
         """
         Retrieve Event Counts for a Team
         ````````````````````````````````
@@ -36,8 +33,8 @@ class TeamStatsEndpoint(TeamEndpoint, EnvironmentMixin, StatsMixin):
         Query ranges are limited to Sentry's configured time-series
         resolutions.
 
-        :pparam string organization_slug: the slug of the organization.
-        :pparam string team_slug: the slug of the team.
+        :pparam string organization_id_or_slug: the id or slug of the organization.
+        :pparam string team_id_or_slug: the id or slug of the team.
         :qparam string stat: the name of the stat to query (``"received"``,
                              ``"rejected"``)
         :qparam timestamp since: a timestamp to set the start of the query
@@ -49,26 +46,21 @@ class TeamStatsEndpoint(TeamEndpoint, EnvironmentMixin, StatsMixin):
         :auth: required
         """
         try:
-            environment_id = self._get_environment_id_from_request(
-                request,
-                team.organization_id,
-            )
+            environment_id = self._get_environment_id_from_request(request, team.organization_id)
         except Environment.DoesNotExist:
             raise ResourceDoesNotExist
 
-        projects = Project.objects.get_for_user(
-            team=team,
-            user=request.user,
-        )
+        projects = Project.objects.get_for_user(team=team, user=request.user)
 
         if not projects:
             return Response([])
 
         data = list(
-            tsdb.get_range(
-                model=tsdb.models.project,
+            tsdb.backend.get_range(
+                model=TSDBModel.project,
                 keys=[p.id for p in projects],
-                **self._parse_args(request, environment_id)
+                **self._parse_args(request, environment_id),
+                tenant_ids={"organization_id": team.organization_id},
             ).values()
         )
 

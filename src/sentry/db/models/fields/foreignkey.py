@@ -1,26 +1,16 @@
-from __future__ import absolute_import
+from __future__ import annotations
 
-from django.conf import settings
+from typing import Any
+
+from django.db import models
 from django.db.models import ForeignKey
 
-__all__ = ('FlexibleForeignKey', )
+from sentry.db.models.fields.types import FieldGetType, FieldSetType
+
+__all__ = ("FlexibleForeignKey",)
 
 
-class FlexibleForeignKey(ForeignKey):
-    def db_type(self, connection):
-        # This is required to support BigAutoField (or anything similar)
-        rel_field = self.related_field
-        if hasattr(rel_field, 'get_related_db_type'):
-            return rel_field.get_related_db_type(connection)
-        return super(FlexibleForeignKey, self).db_type(connection)
-
-
-if 'south' in settings.INSTALLED_APPS:
-    from south.modelsinspector import add_introspection_rules
-
-    add_introspection_rules(
-        [], [
-            "^sentry\.db\.models\.fields\.FlexibleForeignKey",
-            "^sentry\.db\.models\.fields\.foreignkey\.FlexibleForeignKey",
-        ]
-    )
+class FlexibleForeignKey(ForeignKey[FieldSetType, FieldGetType]):
+    def __init__(self, *args: Any, **kwargs: Any):
+        kwargs.setdefault("on_delete", models.CASCADE)
+        super().__init__(*args, **kwargs)

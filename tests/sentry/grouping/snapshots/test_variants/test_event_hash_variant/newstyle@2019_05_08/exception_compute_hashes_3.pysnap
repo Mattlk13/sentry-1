@@ -1,34 +1,34 @@
 ---
-created: '2019-05-08T07:29:42.092362Z'
+created: '2021-02-15T10:11:51.105902Z'
 creator: sentry
 source: tests/sentry/grouping/test_variants.py
 ---
 app:
-  hash: 'b4c29e2a2a2681fbaf9fd8f5b09e4154'
+  hash: null
   component:
-    app*
-      chained-exception*
+    app (exception of system takes precedence)
+      chained-exception (ignored because hash matches system variant)
         exception*
-          stacktrace
-            frame (non app frame)
+          stacktrace*
+            frame*
               filename*
-                u'baz.py'
+                "baz.py"
           type*
-            u'ValueError'
-          value*
-            u'hello world'
+            "ValueError"
+          value (ignored because stacktrace takes precedence)
+            "hello world"
         exception*
-          stacktrace
-            frame (non app frame)
+          stacktrace*
+            frame*
               filename*
-                u'baz.py'
+                "baz.py"
           type*
-            u'ValueError'
-          value*
-            u'hello world'
+            "ValueError"
+          value (ignored because stacktrace takes precedence)
+            "hello world"
 --------------------------------------------------------------------------
 system:
-  hash: '669cb6664e0f5fed38665da04e464f7e'
+  hash: "669cb6664e0f5fed38665da04e464f7e"
   component:
     system*
       chained-exception*
@@ -36,17 +36,17 @@ system:
           stacktrace*
             frame*
               filename*
-                u'baz.py'
+                "baz.py"
           type*
-            u'ValueError'
+            "ValueError"
           value (ignored because stacktrace takes precedence)
-            u'hello world'
+            "hello world"
         exception*
           stacktrace*
             frame*
               filename*
-                u'baz.py'
+                "baz.py"
           type*
-            u'ValueError'
+            "ValueError"
           value (ignored because stacktrace takes precedence)
-            u'hello world'
+            "hello world"

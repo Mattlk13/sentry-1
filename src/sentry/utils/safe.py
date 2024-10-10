@@ -1,45 +1,35 @@
-from __future__ import absolute_import, print_function
-
-import collections
 import logging
-import six
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
+from typing import Any, ParamSpec, TypeVar, Union
 
 from django.conf import settings
-from django.db import transaction
-from django.utils.encoding import force_text
+from django.utils.encoding import force_str
+from django.utils.http import urlencode
 
 from sentry.utils import json
 from sentry.utils.strings import truncatechars
 
+PathSearchable = Union[Mapping[str, Any], Sequence[Any], None]
 
-def safe_execute(func, *args, **kwargs):
-    # TODO: we should make smart savepoints (only executing the savepoint server
-    # side if we execute a query)
-    _with_transaction = kwargs.pop('_with_transaction', True)
-    expected_errors = kwargs.pop('expected_errors', None)
-    _passthrough_errors = kwargs.pop('_passthrough_errors', None)
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def safe_execute(func: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R | None:
     try:
-        if _with_transaction:
-            with transaction.atomic():
-                result = func(*args, **kwargs)
-        else:
-            result = func(*args, **kwargs)
+        result = func(*args, **kwargs)
     except Exception as e:
-        if _passthrough_errors and isinstance(e, _passthrough_errors):
-            raise
-        if hasattr(func, 'im_class'):
+        if hasattr(func, "im_class"):
             cls = func.im_class
         else:
             cls = func.__class__
 
-        func_name = getattr(func, '__name__', six.text_type(func))
+        func_name = getattr(func, "__name__", str(func))
         cls_name = cls.__name__
-        logger = logging.getLogger('sentry.safe.%s' % (cls_name.lower(), ))
+        logger = logging.getLogger(f"sentry.safe.{cls_name.lower()}")
 
-        if expected_errors and isinstance(e, expected_errors):
-            logger.info('%s.process_error_ignored', func_name, extra={'exception': e})
-            return
-        logger.error('%s.process_error', func_name, exc_info=True, extra={'exception': e})
+        logger.exception("%s.process_error", func_name, extra={"exception": e})
+        return None
     else:
         return result
 
@@ -51,7 +41,7 @@ def trim(
     object_hook=None,
     _depth=0,
     _size=0,
-    **kwargs
+    **kwargs,
 ):
     """
     Truncates a value to ```MAX_VARIABLE_SIZE```.
@@ -59,25 +49,25 @@ def trim(
     The method of truncation depends on the type of value.
     """
     options = {
-        'max_depth': max_depth,
-        'max_size': max_size,
-        'object_hook': object_hook,
-        '_depth': _depth + 1,
+        "max_depth": max_depth,
+        "max_size": max_size,
+        "object_hook": object_hook,
+        "_depth": _depth + 1,
     }
 
     if _depth > max_depth:
-        if not isinstance(value, six.string_types):
+        if not isinstance(value, str):
             value = json.dumps(value)
         return trim(value, _size=_size, max_size=max_size)
 
     elif isinstance(value, dict):
-        result = {}
+        result: Any = {}
         _size += 2
-        for k in sorted(value.keys()):
+        for k in sorted(value.keys(), key=lambda x: (len(force_str(value[x])), x)):
             v = value[k]
             trim_v = trim(v, _size=_size, **options)
             result[k] = trim_v
-            _size += len(force_text(trim_v)) + 1
+            _size += len(force_str(trim_v)) + 1
             if _size >= max_size:
                 break
 
@@ -87,13 +77,13 @@ def trim(
         for v in value:
             trim_v = trim(v, _size=_size, **options)
             result.append(trim_v)
-            _size += len(force_text(trim_v))
+            _size += len(force_str(trim_v))
             if _size >= max_size:
                 break
         if isinstance(value, tuple):
             result = tuple(result)
 
-    elif isinstance(value, six.string_types):
+    elif isinstance(value, str):
         result = truncatechars(value, max_size - _size)
 
     else:
@@ -104,27 +94,7 @@ def trim(
     return object_hook(result)
 
 
-def trim_pairs(iterable, max_items=settings.SENTRY_MAX_DICTIONARY_ITEMS, **kwargs):
-    max_items -= 1
-    result = []
-    for idx, item in enumerate(iterable):
-        key, value = item
-        result.append((key, trim(value, **kwargs)))
-        if idx > max_items:
-            return result
-    return result
-
-
-def trim_dict(value, max_items=settings.SENTRY_MAX_DICTIONARY_ITEMS, **kwargs):
-    max_items -= 1
-    for idx, key in enumerate(list(iter(value))):
-        value[key] = trim(value[key], **kwargs)
-        if idx > max_items:
-            del value[key]
-    return value
-
-
-def get_path(data, *path, **kwargs):
+def get_path(data: PathSearchable, *path, should_log=False, **kwargs):
     """
     Safely resolves data from a recursive data structure. A value is only
     returned if the full path exists, otherwise ``None`` is returned.
@@ -135,21 +105,40 @@ def get_path(data, *path, **kwargs):
     filtered with the given callback. Alternatively, pass ``True`` as filter to
     only filter ``None`` values.
     """
-    default = kwargs.pop('default', None)
-    f = kwargs.pop('filter', None)
+    logger = logging.getLogger(__name__)
+    default = kwargs.pop("default", None)
+    f: bool | None = kwargs.pop("filter", None)
     for k in kwargs:
-        raise TypeError("set_path() got an undefined keyword argument '%s'" % k)
+        raise TypeError("get_path() got an undefined keyword argument '%s'" % k)
+
+    logger_data = {}
+    if should_log:
+        logger_data = {
+            "path_searchable": json.dumps(data),
+            "path_arg": json.dumps(path),
+        }
 
     for p in path:
-        if isinstance(data, collections.Mapping) and p in data:
+        if isinstance(data, Mapping) and p in data:
             data = data[p]
-        elif isinstance(data, (list, tuple)) and -len(data) <= p < len(data):
+        elif isinstance(data, (list, tuple)) and isinstance(p, int) and -len(data) <= p < len(data):
             data = data[p]
         else:
+            if should_log:
+                logger_data["invalid_path"] = json.dumps(p)
+                logger.info("sentry.safe.get_path.invalid_path_section", extra=logger_data)
             return default
+
+    if should_log:
+        if data is None:
+            logger.info("sentry.safe.get_path.iterated_path_is_none", extra=logger_data)
+        else:
+            logger_data["iterated_path"] = json.dumps(data)
 
     if f and data and isinstance(data, (list, tuple)):
         data = list(filter((lambda x: x is not None) if f is True else f, data))
+        if should_log and len(data) == 0 and "iterated_path" in logger_data:
+            logger.info("sentry.safe.get_path.filtered_path_is_none", extra=logger_data)
 
     return data if data is not None else default
 
@@ -168,22 +157,22 @@ def set_path(data, *path, **kwargs):
     """
 
     try:
-        value = kwargs.pop('value')
+        value = kwargs.pop("value")
     except KeyError:
         raise TypeError("set_path() requires a 'value' keyword argument")
 
-    overwrite = kwargs.pop('overwrite', True)
+    overwrite = kwargs.pop("overwrite", True)
     for k in kwargs:
         raise TypeError("set_path() got an undefined keyword argument '%s'" % k)
 
     for p in path[:-1]:
-        if not isinstance(data, collections.Mapping):
+        if not isinstance(data, MutableMapping):
             return False
         if data.get(p) is None:
             data[p] = {}
         data = data[p]
 
-    if not isinstance(data, collections.Mapping):
+    if not isinstance(data, MutableMapping):
         return False
 
     p = path[-1]
@@ -203,5 +192,22 @@ def setdefault_path(data, *path, **kwargs):
     This function is equivalent to a recursive dict.setdefault, except for None
     values. Returns True if the value was set, otherwise False.
     """
-    kwargs['overwrite'] = False
+    kwargs["overwrite"] = False
     return set_path(data, *path, **kwargs)
+
+
+def safe_urlencode(query, **kwargs):
+    """
+    django.utils.http.urlencode wrapper that replaces query parameter values
+    of None with empty string so that urlencode doesn't raise TypeError
+    "Cannot encode None in a query string".
+    """
+    # sequence of 2-element tuples
+    if isinstance(query, (list, tuple)):
+        query_seq = ((pair[0], "" if pair[1] is None else pair[1]) for pair in query)
+        return urlencode(query_seq, **kwargs)
+    elif isinstance(query, dict):
+        query_d = {k: "" if v is None else v for k, v in query.items()}
+        return urlencode(query_d, **kwargs)
+    else:
+        return urlencode(query, **kwargs)

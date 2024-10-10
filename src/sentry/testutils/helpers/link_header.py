@@ -20,37 +20,36 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 """
-
-from __future__ import absolute_import
-
-__all__ = ('parse_link_header', )
+from __future__ import annotations
 
 import re
 
+__all__ = ("parse_link_header",)
+
 TOKEN = r'(?:[^\(\)<>@,;:\\"/\[\]\?={} \t]+?)'
 QUOTED_STRING = r'(?:"(?:\\"|[^"])*")'
-PARAMETER = r'(?:%(TOKEN)s(?:=(?:%(TOKEN)s|%(QUOTED_STRING)s))?)' % locals()
-LINK = r'<[^>]*>\s*(?:;\s*%(PARAMETER)s?\s*)*' % locals()
-COMMA = r'(?:\s*(?:,\s*)+)'
-LINK_SPLIT = r'%s(?=%s|\s*$)' % (LINK, COMMA)
+PARAMETER = rf"(?:{TOKEN}(?:=(?:{TOKEN}|{QUOTED_STRING}))?)"
+LINK = rf"<[^>]*>\s*(?:;\s*{PARAMETER}?\s*)*"
+COMMA = r"(?:\s*(?:,\s*)+)"
+LINK_SPLIT = rf"{LINK}(?={COMMA}|\s*$)"
 
 link_splitter = re.compile(LINK_SPLIT)
 
 
-def _unquotestring(instr):
+def _unquotestring(instr: str) -> str:
     if instr[0] == instr[-1] == '"':
         instr = instr[1:-1]
-        instr = re.sub(r'\\(.)', r'\1', instr)
+        instr = re.sub(r"\\(.)", r"\1", instr)
     return instr
 
 
-def _splitstring(instr, item, split):
+def _splitstring(instr: str, item: str, split: str) -> list[str]:
     if not instr:
         return []
-    return [h.strip() for h in re.findall(r'%s(?=%s|\s*$)' % (item, split), instr)]
+    return [h.strip() for h in re.findall(rf"{item}(?={split}|\s*$)", instr)]
 
 
-def parse_link_header(instr):
+def parse_link_header(instr: str) -> dict[str, dict[str, str | None]]:
     """
     Given a link-value (i.e., after separating the header-value on commas),
     return a dictionary whose keys are link URLs and values are dictionaries
@@ -67,15 +66,15 @@ def parse_link_header(instr):
     {'/foo': {'title*': "utf-8'de'letztes%20Kapitel", 'rel': 'self'}}
 
     """
-    out = {}
+    out: dict[str, dict[str, str | None]] = {}
     if not instr:
         return out
 
     for link in [h.strip() for h in link_splitter.findall(instr)]:
         url, params = link.split(">", 1)
         url = url[1:]
-        param_dict = {}
-        for param in _splitstring(params, PARAMETER, "\s*;\s*"):
+        param_dict: dict[str, str | None] = {}
+        for param in _splitstring(params, PARAMETER, r"\s*;\s*"):
             try:
                 a, v = param.split("=", 1)
                 param_dict[a.lower()] = _unquotestring(v)

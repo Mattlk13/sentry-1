@@ -1,42 +1,34 @@
-from __future__ import absolute_import
-
 import logging
 import re
 
-from django.core.urlresolvers import RegexURLResolver, RegexURLPattern
-from django.conf.urls import patterns, include, url
+from django.conf.urls import include
+from django.urls import URLPattern, URLResolver, re_path
 
-from sentry.plugins import plugins
+from sentry.plugins.base import plugins
 
-logger = logging.getLogger('sentry.plugins')
-
-
-def ensure_url(u):
-    if isinstance(u, (tuple, list)):
-        return url(*u)
-    elif not isinstance(u, (RegexURLResolver, RegexURLPattern)):
-        raise TypeError(
-            'url must be RegexURLResolver or RegexURLPattern, not %r: %r' % (type(u).__name__, u)
-        )
-    return u
+logger = logging.getLogger("sentry.plugins")
 
 
 def load_plugin_urls(plugins):
-    urlpatterns = patterns('')
+    urlpatterns = []
     for plugin in plugins:
+        urls = plugin.get_group_urls()
+        if not urls:
+            continue
         try:
-            urls = plugin.get_group_urls()
-            if not urls:
-                continue
-            urls = [ensure_url(u) for u in urls]
+            # a plugin's get_group_urls should return an iterable of re_path()'s,
+            # which can either be RegexURLResolver or RegexURLPattern
+            for u in urls:
+                if not isinstance(u, (URLResolver, URLPattern)):
+                    raise TypeError(
+                        "url must be URLResolver or URLPattern, not {!r}: {!r}".format(
+                            type(u).__name__, u
+                        )
+                    )
         except Exception:
-            logger.exception(
-                'routes.failed', extra={
-                    'plugin': type(plugin).__name__,
-                }
-            )
+            logger.exception("routes.failed", extra={"plugin": type(plugin).__name__})
         else:
-            urlpatterns.append(url(r'^%s/' % re.escape(plugin.slug), include(urls)))
+            urlpatterns.append(re_path(r"^%s/" % re.escape(plugin.slug), include(urls)))
 
     return urlpatterns
 

@@ -1,19 +1,17 @@
-from __future__ import absolute_import
+__all__ = ("Message",)
 
-__all__ = ('Message', )
+import orjson
 
-import six
-
-from sentry.interfaces.base import Interface, prune_empty_keys
-from sentry.utils import json
+from sentry.interfaces.base import Interface
+from sentry.utils.json import prune_empty_keys
 
 
 def stringify(value):
-    if isinstance(value, six.string_types):
+    if isinstance(value, str):
         return value
 
     if isinstance(value, (int, float, bool)):
-        return json.dumps(value)
+        return orjson.dumps(value)
 
     return None
 
@@ -31,27 +29,23 @@ class Message(Interface):
     >>>     "params": ["this"]
     >>> }
     """
+
     score = 0
     display_score = 2050
-    path = 'logentry'
-    external_type = 'message'
+    path = "logentry"
+    external_type = "message"
 
     @classmethod
-    def to_python(cls, data):
-        for key in (
-            'message',
-            'formatted',
-            'params',
-        ):
+    def to_python(cls, data, **kwargs):
+        for key in ("message", "formatted", "params"):
             data.setdefault(key, None)
-        return cls(**data)
+
+        return super().to_python(data, **kwargs)
 
     def to_json(self):
-        return prune_empty_keys({
-            'message': self.message,
-            'formatted': self.formatted,
-            'params': self.params or None
-        })
+        return prune_empty_keys(
+            {"message": self.message, "formatted": self.formatted, "params": self.params or None}
+        )
 
-    def to_string(self, event, is_public=False, **kwargs):
+    def to_string(self, event) -> str:
         return self.formatted or self.message

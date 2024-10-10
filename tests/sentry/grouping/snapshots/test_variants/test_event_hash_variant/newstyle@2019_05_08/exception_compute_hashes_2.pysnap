@@ -1,32 +1,32 @@
 ---
-created: '2019-05-08T07:29:42.082698Z'
+created: '2021-02-15T10:11:51.448335Z'
 creator: sentry
 source: tests/sentry/grouping/test_variants.py
 ---
 app:
-  hash: None
+  hash: null
   component:
     app (exception of system takes precedence)
-      exception (ignored because this variant does not have a contributing stacktrace, but the system variant does)
-        stacktrace
-          frame (non app frame)
+      exception (ignored because hash matches system variant)
+        stacktrace*
+          frame*
             filename*
-              u'baz.py'
+              "baz.py"
         type*
-          u'ValueError'
-        value*
-          u'hello world'
+          "ValueError"
+        value (ignored because stacktrace takes precedence)
+          "hello world"
 --------------------------------------------------------------------------
 system:
-  hash: '9509e122c6175606d52862fa4f64853c'
+  hash: "9509e122c6175606d52862fa4f64853c"
   component:
     system*
       exception*
         stacktrace*
           frame*
             filename*
-              u'baz.py'
+              "baz.py"
         type*
-          u'ValueError'
+          "ValueError"
         value (ignored because stacktrace takes precedence)
-          u'hello world'
+          "hello world"

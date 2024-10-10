@@ -1,18 +1,17 @@
-from __future__ import absolute_import, print_function
+from __future__ import annotations
 
 import logging
-import six
+import pickle
 
-from django.conf import settings
-from django.db.models import TextField
+from django.db.models import Model, TextField
 
 from sentry.db.models.utils import Creator
-from sentry.utils.compat import pickle
-from sentry.utils.strings import decompress, compress
+from sentry.utils import json
+from sentry.utils.strings import decompress
 
-__all__ = ('GzippedDictField', )
+__all__ = ("GzippedDictField",)
 
-logger = logging.getLogger('sentry')
+logger = logging.getLogger("sentry")
 
 
 class GzippedDictField(TextField):
@@ -21,41 +20,42 @@ class GzippedDictField(TextField):
     value is a dictionary.
     """
 
-    def contribute_to_class(self, cls, name):
+    def contribute_to_class(self, cls: type[Model], name: str, private_only: bool = False) -> None:
         """
         Add a descriptor for backwards compatibility
         with previous Django behavior.
         """
-        super(GzippedDictField, self).contribute_to_class(cls, name)
+        super().contribute_to_class(cls, name, private_only=private_only)
         setattr(cls, name, Creator(self))
 
     def to_python(self, value):
-        if isinstance(value, six.string_types) and value:
-            try:
-                value = pickle.loads(decompress(value))
-            except Exception as e:
-                logger.exception(e)
+        try:
+            if not value:
                 return {}
-        elif not value:
-            return {}
-        return value
+            return json.loads(value)
+        except (ValueError, TypeError):
+            if isinstance(value, str) and value:
+                try:
+                    value = pickle.loads(decompress(value))
+                except Exception as e:
+                    logger.exception(str(e))
+                    return {}
+            elif not value:
+                return {}
+            return value
+
+    def from_db_value(self, value, expression, connection):
+        return self.to_python(value)
 
     def get_prep_value(self, value):
         if not value and self.null:
             # save ourselves some storage
             return None
-        # enforce six.text_type strings to guarantee consistency
-        if isinstance(value, six.binary_type):
-            value = six.text_type(value)
-        # db values need to be in unicode
-        return compress(pickle.dumps(value))
+        elif isinstance(value, bytes):
+            value = value.decode("utf-8")
+        if value is None and self.null:
+            return None
+        return json.dumps(value)
 
     def value_to_string(self, obj):
-        value = self._get_val_from_obj(obj)
-        return self.get_prep_value(value)
-
-
-if 'south' in settings.INSTALLED_APPS:
-    from south.modelsinspector import add_introspection_rules
-
-    add_introspection_rules([], ["^sentry\.db\.models\.fields\.gzippeddict\.GzippedDictField"])
+        return self.get_prep_value(self.value_from_object(obj))

@@ -1,29 +1,30 @@
-from __future__ import absolute_import
+from functools import cached_property
 
-from django.core.urlresolvers import reverse
-from exam import fixture
+from django.urls import reverse
 
-from sentry.testutils import TestCase
+from sentry.testutils.cases import TestCase
+from sentry.testutils.silo import control_silo_test
 
 
+@control_silo_test
 class ReactivateAccountTest(TestCase):
-    @fixture
+    @cached_property
     def path(self):
-        return reverse('sentry-reactivate-account')
+        return reverse("sentry-reactivate-account")
 
     def test_renders(self):
-        user = self.create_user('foo@example.com', is_active=False)
+        user = self.create_user("foo@example.com", is_active=False)
 
         self.login_as(user)
 
         resp = self.client.get(self.path)
         assert resp.status_code == 200
-        self.assertTemplateUsed(resp, 'sentry/reactivate-account.html')
+        self.assertTemplateUsed(resp, "sentry/reactivate-account.html")
 
     def test_does_reactivate(self):
-        user = self.create_user('foo@example.com', is_active=False)
+        user = self.create_user("foo@example.com", is_active=False)
 
         self.login_as(user)
 
-        resp = self.client.post(self.path, data={'op': 'confirm'})
+        resp = self.client.post(self.path, data={"op": "confirm"})
         assert resp.status_code == 302

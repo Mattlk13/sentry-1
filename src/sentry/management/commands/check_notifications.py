@@ -1,60 +1,46 @@
-from __future__ import absolute_import, print_function
-
 from django.core.management.base import BaseCommand, CommandError
 
-from sentry.models import User
+from sentry.mail import mail_adapter
+from sentry.models.organization import Organization
+from sentry.models.project import Project
+from sentry.utils.email import get_email_addresses
 
 
-def find_mail_plugin():
-    from sentry.plugins import plugins
-    for plugin in plugins.all():
-        if type(plugin).__name__.endswith('MailPlugin'):
-            return plugin
-    assert False, 'MailPlugin cannot be found'
+def handle_project(project: Project, stream) -> None:
+    """
+    For every user that should receive ISSUE_ALERT notifications for a given
+    project, write a map of usernames to email addresses to the given stream
+    one entry per line.
+    """
+    stream.write("# Project: %s\n" % project)
 
-
-def handle_project(plugin, project, stream):
-    stream.write('# Project: %s\n' % project)
-    from sentry.utils.email import get_email_addresses
-    user_ids = plugin.get_sendable_users(project)
-    users = User.objects.in_bulk(user_ids)
-    for user_id, email in get_email_addresses(user_ids, project).items():
-        stream.write(u'{}: {}\n'.format(users[user_id].username, email))
+    users = mail_adapter.get_sendable_user_objects(project)
+    users_map = {user.id: user for user in users}
+    emails = get_email_addresses(users_map.keys(), project)
+    for user_id, email in emails.items():
+        stream.write(f"{users_map[user_id].username}: {email}\n")
 
 
 class Command(BaseCommand):
-    help = 'Dump addresses that would get an email notification'
+    help = "Dump addresses that would get an email notification"
 
     def add_arguments(self, parser):
         parser.add_argument(
-            '--organization',
-            action='store',
-            type=int,
-            dest='organization',
-            default=0,
-            help='',
+            "--organization", action="store", type=int, dest="organization", default=0, help=""
         )
         parser.add_argument(
-            '--project',
-            action='store',
-            type=int,
-            dest='project',
-            default=0,
-            help='',
+            "--project", action="store", type=int, dest="project", default=0, help=""
         )
 
     def handle(self, *args, **options):
-        if not (options['project'] or options['organization']):
-            raise CommandError('Must specify either a project or organization')
+        if not (options["project"] or options["organization"]):
+            raise CommandError("Must specify either a project or organization")
 
-        from sentry.models import Project, Organization
-        if options['organization']:
-            projects = list(Organization.objects.get(pk=options['organization']).project_set.all())
+        if options["organization"]:
+            projects = list(Organization.objects.get(pk=options["organization"]).project_set.all())
         else:
-            projects = [Project.objects.get(pk=options['project'])]
-
-        plugin = find_mail_plugin()
+            projects = [Project.objects.get(pk=options["project"])]
 
         for project in projects:
-            handle_project(plugin, project, self.stdout)
-            self.stdout.write('\n')
+            handle_project(project, self.stdout)
+            self.stdout.write("\n")

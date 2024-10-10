@@ -1,48 +1,43 @@
-from __future__ import absolute_import
+from __future__ import annotations
 
-import six
-import warnings
-import time
+import contextlib
 import logging
+import time
+import warnings
+from io import BytesIO
+from typing import Any, NamedTuple
+from urllib.parse import urlparse
+
+from django.conf import settings
+from django.core.exceptions import SuspiciousOperation
+from requests.exceptions import ReadTimeout, RequestException, Timeout
 
 from sentry import options
-from django.core.exceptions import SuspiciousOperation
-from collections import namedtuple
-from django.conf import settings
-from requests.exceptions import RequestException, Timeout, ReadTimeout
-from six.moves.urllib.parse import urlparse
-
-from sentry.models import EventError
 from sentry.exceptions import RestrictedIPAddress
+from sentry.models.eventerror import EventError
+from sentry.net.http import SafeSession
+
+# Importing for backwards compatible API
+from sentry.net.socket import is_safe_hostname, is_valid_url  # NOQA
 from sentry.utils.cache import cache
 from sentry.utils.hashlib import md5_text
 from sentry.utils.strings import truncatechars
-
-# Importing for backwards compatible API
-from sentry.net.socket import safe_socket_connect, is_valid_url, is_safe_hostname  # NOQA
-from sentry.net.http import SafeSession
 
 logger = logging.getLogger(__name__)
 
 # TODO(dcramer): we want to change these to be constants so they are easier
 # to translate/link again
-# the maximum number of remote resources (i.e. sourc eifles) that should be
+# the maximum number of remote resources (i.e. source files) that should be
 # fetched
 MAX_URL_LENGTH = 150
 
-# UrlResult.body **must** be bytes
-UrlResult = namedtuple('UrlResult', ['url', 'headers', 'body', 'status', 'encoding'])
 
-# In case SSL is unavailable (light builds) we can't import this here.
-try:
-    from OpenSSL.SSL import ZeroReturnError, Error as OpenSSLError
-except ImportError:
-
-    class ZeroReturnError(Exception):
-        pass
-
-    class OpenSSLError(Exception):
-        pass
+class UrlResult(NamedTuple):
+    url: str
+    headers: dict[str, str]
+    body: bytes
+    status: int
+    encoding: str | None
 
 
 class BadSource(Exception):
@@ -51,8 +46,8 @@ class BadSource(Exception):
     def __init__(self, data=None):
         if data is None:
             data = {}
-        data.setdefault('type', self.error_type)
-        super(BadSource, self).__init__(data['type'])
+        data.setdefault("type", self.error_type)
+        super().__init__(data["type"])
         self.data = data
 
 
@@ -60,8 +55,8 @@ class CannotFetch(BadSource):
     error_type = EventError.FETCH_GENERIC_ERROR
 
 
-def get_server_hostname():
-    return urlparse(options.get('system.url-prefix')).hostname
+def get_server_hostname() -> str:
+    return urlparse(options.get("system.url-prefix")).hostname
 
 
 build_session = SafeSession
@@ -77,47 +72,48 @@ def safe_urlopen(
     allow_redirects=False,
     timeout=30,
     verify_ssl=True,
-    user_agent=None
+    user_agent=None,
+    stream=False,
 ):
     """
     A slightly safer version of ``urlib2.urlopen`` which prevents redirection
     and ensures the URL isn't attempting to hit a blacklisted IP range.
     """
     if user_agent is not None:
-        warnings.warn('user_agent is no longer used with safe_urlopen')
+        warnings.warn("user_agent is no longer used with safe_urlopen")
 
-    session = SafeSession()
+    with SafeSession() as session:
+        kwargs = {}
 
-    kwargs = {}
+        if json:
+            kwargs["json"] = json
+            if not headers:
+                headers = {}
+            headers.setdefault("Content-Type", "application/json")
 
-    if json:
-        kwargs['json'] = json
-        if not headers:
-            headers = {}
-        headers.setdefault('Content-Type', 'application/json')
+        if data:
+            kwargs["data"] = data
 
-    if data:
-        kwargs['data'] = data
+        if params:
+            kwargs["params"] = params
 
-    if params:
-        kwargs['params'] = params
+        if headers:
+            kwargs["headers"] = headers
 
-    if headers:
-        kwargs['headers'] = headers
+        if method is None:
+            method = "POST" if (data or json) else "GET"
 
-    if method is None:
-        method = 'POST' if (data or json) else 'GET'
+        response = session.request(
+            method=method,
+            url=url,
+            allow_redirects=allow_redirects,
+            timeout=timeout,
+            verify=verify_ssl,
+            stream=stream,
+            **kwargs,
+        )
 
-    response = session.request(
-        method=method,
-        url=url,
-        allow_redirects=allow_redirects,
-        timeout=timeout,
-        verify=verify_ssl,
-        **kwargs
-    )
-
-    return response
+        return response
 
 
 def safe_urlread(response):
@@ -126,66 +122,78 @@ def safe_urlread(response):
 
 def expose_url(url):
     if url is None:
-        return u'<unknown>'
-    if url[:5] == 'data:':
-        return u'<data url>'
+        return "<unknown>"
+    if url[:5] == "data:":
+        return "<data url>"
     url = truncatechars(url, MAX_URL_LENGTH)
-    if isinstance(url, six.binary_type):
-        url = url.decode('utf-8', 'replace')
+    if isinstance(url, bytes):
+        url = url.decode("utf-8", "replace")
     return url
 
 
+def get_domain_key(url: str) -> str:
+    domain = urlparse(url).netloc
+    return f"source:blacklist:v2:{md5_text(domain).hexdigest()}"
+
+
+def lock_domain(url, error=None):
+    error = dict(error or {})
+    if error.get("type") is None:
+        error["type"] = EventError.UNKNOWN_ERROR
+    if error.get("url") is None:
+        error["url"] = expose_url(url)
+    domain_key = get_domain_key(url)
+    cache.set(domain_key, error, 300)
+    logger.warning("source.disabled", extra=error)
+
+
 def fetch_file(
-    url,
-    domain_lock_enabled=True,
-    outfile=None,
-    headers=None,
-    allow_redirects=True,
-    verify_ssl=False,
-    timeout=settings.SENTRY_SOURCE_FETCH_SOCKET_TIMEOUT,
-    **kwargs
-):
+    url: str,
+    domain_lock_enabled: bool = True,
+    headers: dict[str, str] | None = None,
+    allow_redirects: bool = True,
+    verify_ssl: bool = False,
+    timeout: float = settings.SENTRY_SOURCE_FETCH_SOCKET_TIMEOUT,
+    **kwargs: Any,
+) -> UrlResult:
     """
     Pull down a URL, returning a UrlResult object.
     """
     # lock down domains that are problematic
     if domain_lock_enabled:
-        domain = urlparse(url).netloc
-        domain_key = 'source:blacklist:v2:%s' % (md5_text(domain).hexdigest(), )
+        domain_key = get_domain_key(url)
         domain_result = cache.get(domain_key)
         if domain_result:
-            domain_result['url'] = url
+            domain_result["url"] = url
             raise CannotFetch(domain_result)
 
-    logger.debug('Fetching %r from the internet', url)
+    logger.debug("Fetching %r from the internet", url)
 
-    http_session = SafeSession()
-    response = None
+    with contextlib.ExitStack() as ctx:
+        http_session = ctx.enter_context(SafeSession())
 
-    try:
         try:
-            start = time.time()
-            response = http_session.get(
-                url,
-                allow_redirects=allow_redirects,
-                verify=verify_ssl,
-                headers=headers,
-                timeout=timeout,
-                stream=True,
-                **kwargs
+            start = time.monotonic()
+            response = ctx.enter_context(
+                http_session.get(
+                    url,
+                    allow_redirects=allow_redirects,
+                    verify=verify_ssl,
+                    headers=headers,
+                    timeout=timeout,
+                    stream=True,
+                    **kwargs,
+                )
             )
 
             try:
-                cl = int(response.headers['content-length'])
+                cl = int(response.headers["content-length"])
             except (LookupError, ValueError):
                 cl = 0
             if cl > settings.SENTRY_SOURCE_FETCH_MAX_SIZE:
                 raise OverflowError()
 
-            return_body = False
-            if outfile is None:
-                outfile = six.BytesIO()
-                return_body = True
+            outfile = BytesIO()
 
             cl = 0
 
@@ -193,7 +201,7 @@ def fetch_file(
             # got a 200 OK
             if response.status_code == 200:
                 for chunk in response.iter_content(16 * 1024):
-                    if time.time() - start > settings.SENTRY_SOURCE_FETCH_TIMEOUT:
+                    if time.monotonic() - start > settings.SENTRY_SOURCE_FETCH_TIMEOUT:
                         raise Timeout()
                     outfile.write(chunk)
                     cl += len(chunk)
@@ -201,60 +209,35 @@ def fetch_file(
                         raise OverflowError()
 
         except Exception as exc:
-            logger.debug('Unable to fetch %r', url, exc_info=True)
+            logger.debug("Unable to fetch %r", url, exc_info=True)
             if isinstance(exc, RestrictedIPAddress):
-                error = {
-                    'type': EventError.RESTRICTED_IP,
-                    'url': expose_url(url),
-                }
+                error: dict[str, Any] = {"type": EventError.RESTRICTED_IP}
             elif isinstance(exc, SuspiciousOperation):
-                error = {
-                    'type': EventError.SECURITY_VIOLATION,
-                    'url': expose_url(url),
-                }
+                error = {"type": EventError.SECURITY_VIOLATION}
             elif isinstance(exc, (Timeout, ReadTimeout)):
                 error = {
-                    'type': EventError.FETCH_TIMEOUT,
-                    'url': expose_url(url),
-                    'timeout': settings.SENTRY_SOURCE_FETCH_TIMEOUT,
+                    "type": EventError.FETCH_TIMEOUT,
+                    "timeout": settings.SENTRY_SOURCE_FETCH_TIMEOUT,
                 }
             elif isinstance(exc, OverflowError):
                 error = {
-                    'type': EventError.FETCH_TOO_LARGE,
-                    'url': expose_url(url),
+                    "type": EventError.FETCH_TOO_LARGE,
                     # We want size in megabytes to format nicely
-                    'max_size': float(settings.SENTRY_SOURCE_FETCH_MAX_SIZE) / 1024 / 1024,
+                    "max_size": float(settings.SENTRY_SOURCE_FETCH_MAX_SIZE) / 1024 / 1024,
                 }
-            elif isinstance(exc, (RequestException, ZeroReturnError, OpenSSLError)):
+            elif isinstance(exc, RequestException):
                 error = {
-                    'type': EventError.FETCH_GENERIC_ERROR,
-                    'value': six.text_type(type(exc)),
-                    'url': expose_url(url),
+                    "type": EventError.FETCH_GENERIC_ERROR,
+                    "value": f"{type(exc)}",
                 }
             else:
-                logger.exception(six.text_type(exc))
-                error = {
-                    'type': EventError.UNKNOWN_ERROR,
-                    'url': expose_url(url),
-                }
+                logger.exception(str(exc))
+                error = {"type": EventError.UNKNOWN_ERROR}
 
             # TODO(dcramer): we want to be less aggressive on disabling domains
             if domain_lock_enabled:
-                cache.set(domain_key, error or '', 300)
-                logger.warning('source.disabled', extra=error)
+                lock_domain(url, error)
             raise CannotFetch(error)
 
-        headers = {k.lower(): v for k, v in response.headers.items()}
-        encoding = response.encoding
-
-        body = None
-        if return_body:
-            body = outfile.getvalue()
-            outfile.close()  # we only want to close StringIO
-
-        result = (headers, body, response.status_code, encoding)
-    finally:
-        if response is not None:
-            response.close()
-
-    return UrlResult(url, result[0], result[1], result[2], result[3])
+    headers = {k.lower(): v for k, v in response.headers.items()}
+    return UrlResult(url, headers, outfile.getvalue(), response.status_code, response.encoding)

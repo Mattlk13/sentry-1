@@ -1,36 +1,62 @@
-from __future__ import absolute_import, print_function
+from __future__ import annotations
 
+import dataclasses
 import logging
-import six
-
-from collections import namedtuple
-from time import time
 from random import random
+from time import time
+from typing import Any
 
-from django.db.utils import ProgrammingError, OperationalError
+from django.conf import settings
+from django.db.utils import OperationalError, ProgrammingError
 from django.utils import timezone
-from django.utils.functional import cached_property
-from sentry.db.models.query import create_or_update
-from sentry.utils.hashlib import md5_text
 
-Key = namedtuple('Key', ('name', 'default', 'type', 'flags', 'ttl', 'grace', 'cache_key'))
+from sentry.db.postgres.transactions import in_test_hide_transaction_boundary
+from sentry.options.manager import UpdateChannel
 
-CACHE_FETCH_ERR = 'Unable to fetch option cache for %s'
-CACHE_UPDATE_ERR = 'Unable to update option cache for %s'
+CACHE_FETCH_ERR = "Unable to fetch option cache for %s"
+CACHE_UPDATE_ERR = "Unable to update option cache for %s"
 
-logger = logging.getLogger('sentry')
+logger = logging.getLogger("sentry")
 
 
-def _make_cache_key(key):
-    return 'o:%s' % md5_text(key).hexdigest()
+@dataclasses.dataclass
+class GroupingInfo:
+    # Name of the group of options to include this option in
+    name: str
+    # Order of the option within the group
+    order: int
+
+
+@dataclasses.dataclass
+class Key:
+    name: str
+    default: Any
+    type: type
+    flags: int
+    ttl: int
+    grace: int
+    cache_key: str
+    grouping_info: GroupingInfo | None
+
+    def has_any_flag(self, flags: set[int]) -> bool:
+        """
+        Returns true if the option is registered with at least one
+        of the flags passed as argument.
+        """
+        assert flags, "Flags must be provided to check the option."
+        for f in flags:
+            if self.flags & f:
+                return True
+
+        return False
 
 
 def _make_cache_value(key, value):
     now = int(time())
-    return (value, now + key.ttl, now + key.ttl + key.grace, )
+    return (value, now + key.ttl, now + key.ttl + key.grace)
 
 
-class OptionsStore(object):
+class OptionsStore:
     """
     Abstraction for the Option storage logic that should be driven
     by the OptionsManager.
@@ -47,13 +73,18 @@ class OptionsStore(object):
         self.ttl = ttl
         self.flush_local_cache()
 
-    @cached_property
+    @property
     def model(self):
-        from sentry.models.option import Option
-        return Option
+        return self.model_cls()
 
-    def make_key(self, name, default, type, flags, ttl, grace):
-        return Key(name, default, type, flags, int(ttl), int(grace), _make_cache_key(name))
+    @classmethod
+    def model_cls(cls):
+        from sentry.models.options import ControlOption, Option
+        from sentry.silo.base import SiloMode
+
+        if SiloMode.get_current_mode() == SiloMode.CONTROL:
+            return ControlOption
+        return Option
 
     def get(self, key, silent=False):
         """
@@ -73,7 +104,7 @@ class OptionsStore(object):
 
     def get_cache(self, key, silent=False):
         """
-        First check agaist our local in-process cache, falling
+        First check against our local in-process cache, falling
         back to the network cache.
         """
         value = self.get_local_cache(key)
@@ -88,9 +119,7 @@ class OptionsStore(object):
             value = self.cache.get(cache_key)
         except Exception:
             if not silent:
-                logger.warn(CACHE_FETCH_ERR, key.name, extra={
-                    'key': key.name,
-                }, exc_info=True)
+                logger.warning(CACHE_FETCH_ERR, key.name, extra={"key": key.name}, exc_info=True)
             value = None
 
         if value is not None and key.ttl > 0:
@@ -156,14 +185,19 @@ class OptionsStore(object):
         is limited at the moment.
         """
         try:
-            value = self.model.objects.get(key=key.name).value
+            # NOTE: To greatly reduce test bugs due to cache leakage, we don't enforce cross db constraints
+            # because in practice the option query is consistent with the process level silo mode.
+            # If you do change the way the option class model is picked, keep in mind it may not be deeply
+            # tested due to the core assumption it should be stable per process in practice.
+            with in_test_hide_transaction_boundary():
+                value = self.model.objects.get(key=key.name).value
         except (self.model.DoesNotExist, ProgrammingError, OperationalError):
             value = None
         except Exception:
-            if not silent:
-                logger.exception('option.failed-lookup', extra={
-                    'key': key.name,
-                })
+            if settings.SENTRY_OPTIONS_COMPLAIN_ON_ERRORS:
+                raise
+            elif not silent:
+                logger.exception("option.failed-lookup", extra={"key": key.name})
             value = None
         else:
             # we only attempt to populate the cache if we were previously
@@ -174,31 +208,45 @@ class OptionsStore(object):
                 self.set_cache(key, value)
             except Exception:
                 if not silent:
-                    logger.warn(CACHE_UPDATE_ERR, key.name, extra={
-                        'key': key.name,
-                    }, exc_info=True)
+                    logger.warning(
+                        CACHE_UPDATE_ERR, key.name, extra={"key": key.name}, exc_info=True
+                    )
         return value
 
-    def set(self, key, value):
+    def get_last_update_channel(self, key) -> UpdateChannel | None:
+        """
+        Gets how the option was last updated to check for drift.
+        """
+        try:
+            option = self.model.objects.get(key=key.name)
+        except self.model.DoesNotExist:
+            return None
+
+        return UpdateChannel(option.last_updated_by)
+
+    def set(self, key, value, channel: UpdateChannel):
         """
         Store a value in the option store. Value must get persisted to database first,
         then attempt caches. If it fails database, the entire operation blows up.
         If cache fails, we ignore silently since it'll get repaired later by sync_options.
         A boolean is returned to indicate if the network cache was set successfully.
         """
-        assert self.cache is not None, 'cache must be configured before mutating options'
+        assert self.cache is not None, "cache must be configured before mutating options"
 
-        self.set_store(key, value)
+        self.set_store(key, value, channel)
         return self.set_cache(key, value)
 
-    def set_store(self, key, value):
+    def set_store(self, key, value, channel: UpdateChannel):
+        from sentry.db.models.query import create_or_update
+
         create_or_update(
             model=self.model,
             key=key.name,
             values={
-                'value': value,
-                'last_updated': timezone.now(),
-            }
+                "value": value,
+                "last_updated": timezone.now(),
+                "last_updated_by": channel.value,
+            },
         )
 
     def set_cache(self, key, value):
@@ -214,9 +262,7 @@ class OptionsStore(object):
             self.cache.set(cache_key, value, self.ttl)
             return True
         except Exception:
-            logger.warn(CACHE_UPDATE_ERR, key.name, extra={
-                'key': key.name,
-            }, exc_info=True)
+            logger.warning(CACHE_UPDATE_ERR, key.name, extra={"key": key.name}, exc_info=True)
             return False
 
     def delete(self, key):
@@ -226,7 +272,7 @@ class OptionsStore(object):
         If database succeeds, caches are then allowed to fail silently.
         A boolean is returned to indicate if the network deletion succeeds.
         """
-        assert self.cache is not None, 'cache must be configured before mutating options'
+        assert self.cache is not None, "cache must be configured before mutating options"
 
         self.delete_store(key)
         return self.delete_cache(key)
@@ -245,9 +291,7 @@ class OptionsStore(object):
             self.cache.delete(cache_key)
             return True
         except Exception:
-            logger.warn(CACHE_UPDATE_ERR, key.name, extra={
-                'key': key.name,
-            }, exc_info=True)
+            logger.warning(CACHE_UPDATE_ERR, key.name, extra={"key": key.name}, exc_info=True)
             return False
 
     def clean_local_cache(self):
@@ -259,7 +303,7 @@ class OptionsStore(object):
         now = int(time())
 
         try:
-            for k, (_, _, grace) in six.iteritems(self._local_cache):
+            for k, (_, _, grace) in self._local_cache.items():
                 if now > grace:
                     to_expire.append(k)
         except RuntimeError:
@@ -296,8 +340,8 @@ class OptionsStore(object):
         if random() < 0.25:
             self.clean_local_cache()
 
-    def connect_signals(self):
-        from celery.signals import task_postrun
-        from django.core.signals import request_finished
-        task_postrun.connect(self.maybe_clean_local_cache)
-        request_finished.connect(self.maybe_clean_local_cache)
+    def close(self) -> None:
+        self.clean_local_cache()
+
+    def set_cache_impl(self, cache) -> None:
+        self.cache = cache

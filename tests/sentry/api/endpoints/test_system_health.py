@@ -1,15 +1,13 @@
-from __future__ import absolute_import
+from django.urls import reverse
 
-from django.core.urlresolvers import reverse
-
-from sentry.testutils import APITestCase
+from sentry.testutils.cases import APITestCase
 
 
 class SystemHealthTest(APITestCase):
     def test_simple(self):
         self.login_as(user=self.user, superuser=True)
-        url = reverse('sentry-api-0-system-health')
+        url = reverse("sentry-api-0-system-health")
         response = self.client.get(url)
         assert response.status_code == 200
-        assert 'problems' in response.data
-        assert 'healthy' in response.data
+        assert "problems" in response.data
+        assert "healthy" in response.data

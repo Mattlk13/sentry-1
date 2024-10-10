@@ -1,19 +1,18 @@
-from __future__ import absolute_import
-
-from django.conf.urls import patterns, url
+from django.urls import re_path
 
 from .search import JiraServerSearchEndpoint
-from .webhooks import JiraIssueUpdatedWebhook
+from .webhooks import JiraServerIssueUpdatedWebhook
 
-urlpatterns = patterns(
-    '',
-    url(
-        r'^issue-updated/(?P<token>[^\/]+)/$',
-        JiraIssueUpdatedWebhook.as_view(),
-        name='sentry-extensions-jiraserver-issue-updated'
+# If updating/adding URLs here, make sure to update the JiraServerRequestParser as well
+urlpatterns = [
+    re_path(
+        r"^issue-updated/(?P<token>[^\/]+)/$",
+        JiraServerIssueUpdatedWebhook.as_view(),
+        name="sentry-extensions-jiraserver-issue-updated",
     ),
-    url(r'^search/(?P<organization_slug>[^\/]+)/(?P<integration_id>\d+)/$',
+    re_path(
+        r"^search/(?P<organization_id_or_slug>[^\/]+)/(?P<integration_id>\d+)/$",
         JiraServerSearchEndpoint.as_view(),
-        name='sentry-extensions-jiraserver-search'
-        ),
-)
+        name="sentry-extensions-jiraserver-search",
+    ),
+]

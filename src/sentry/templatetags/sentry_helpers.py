@@ -1,41 +1,28 @@
-from __future__ import absolute_import
-
 import functools
 import os.path
+import random
 from collections import namedtuple
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from random import randint
+from urllib.parse import quote, urlencode
 
-import six
 from django import template
-from django.core.urlresolvers import reverse
 from django.template.defaultfilters import stringfilter
-from django.utils import timezone
-from django.utils.html import escape
-from django.utils.safestring import mark_safe
-from django.utils.translation import ugettext as _
-from pkg_resources import parse_version as Version
+from django.utils import timezone as django_timezone
+from django.utils.translation import gettext as _
+from packaging.version import parse as parse_version
 
 from sentry import options
 from sentry.api.serializers import serialize as serialize_func
-from sentry.models import Organization
 from sentry.utils import json
 from sentry.utils.strings import soft_break as _soft_break
-from sentry.utils.strings import soft_hyphenate, to_unicode, truncatechars
-from six.moves import range
-from six.moves.urllib.parse import quote
+from sentry.utils.strings import soft_hyphenate, truncatechars
 
-SentryVersion = namedtuple('SentryVersion', [
-    'current',
-    'latest',
-    'update_available',
-    'build',
-])
+SentryVersion = namedtuple("SentryVersion", ["current", "latest", "update_available", "build"])
 
 register = template.Library()
 
-truncatechars = register.filter(stringfilter(truncatechars))
-truncatechars.is_safe = True
+truncatechars = register.filter(stringfilter(truncatechars), is_safe=True)
 
 
 @register.filter
@@ -46,7 +33,7 @@ def to_json(obj, request=None):
 @register.filter
 def multiply(x, y):
     def coerce(value):
-        if isinstance(value, (six.integer_types, float)):
+        if isinstance(value, ((int,), float)):
             return value
         try:
             return int(value)
@@ -75,12 +62,12 @@ class AbsoluteUriNode(template.Node):
             try:
                 arg = template.Variable(arg).resolve(context)
             except template.VariableDoesNotExist:
-                arg = ''
+                arg = ""
             args.append(arg)
 
         # No args is just fine
         if not args:
-            rv = ''
+            rv = ""
         # If there's only 1 argument, there's nothing to format
         elif len(args) == 1:
             rv = args[0]
@@ -93,7 +80,7 @@ class AbsoluteUriNode(template.Node):
         # to a variable instead of actually returning.
         if self.target_var is not None:
             context[self.target_var] = rv
-            rv = ''
+            rv = ""
 
         return rv
 
@@ -102,7 +89,7 @@ class AbsoluteUriNode(template.Node):
 def absolute_uri(parser, token):
     bits = token.split_contents()[1:]
     # Check if the last two bits are `as {var}`
-    if len(bits) >= 2 and bits[-2] == 'as':
+    if len(bits) >= 2 and bits[-2] == "as":
         target_var = bits[-1]
         bits = bits[:-2]
     else:
@@ -110,53 +97,59 @@ def absolute_uri(parser, token):
     return AbsoluteUriNode(bits, target_var)
 
 
-@register.assignment_tag(takes_context=True)
-def url_with_referrer(context, viewname, *args):
-    url = reverse(viewname, args=args)
-    if context.get('referrer'):
-        url += '?referrer=%s' % context['referrer']
-    return url
+@register.simple_tag
+def org_url(organization, path, query=None, fragment=None) -> str:
+    """
+    Generate an absolute url for an organization
+    """
+    if not hasattr(organization, "absolute_url"):
+        raise RuntimeError("organization parameter is not an Organization instance")
+    return organization.absolute_url(path, query=query, fragment=fragment)
+
+
+@register.simple_tag
+def loading_message():
+    options = [
+        "Please wait while we load an obnoxious amount of JavaScript.",
+        "Escaping node_modules gravity well.",
+        "Parallelizing webpack builders.",
+        "Awaiting solution to the halting problem.",
+        "Collapsing wavefunctions.",
+    ]
+    return random.choice(options)
+
+
+@register.simple_tag
+def querystring(**kwargs):
+    return urlencode(kwargs, doseq=False)
 
 
 @register.simple_tag
 def system_origin():
     from sentry.utils.http import absolute_uri, origin_from_url
+
     return origin_from_url(absolute_uri())
 
 
 @register.simple_tag
 def security_contact():
-    return options.get('system.security-email') or options.get('system.admin-email')
-
-
-@register.filter
-def pprint(value, break_after=10):
-    """
-    break_after is used to define how often a <span> is
-    inserted (for soft wrapping).
-    """
-
-    value = to_unicode(value)
-    return mark_safe(
-        u'<span></span>'.
-        join([escape(value[i:(i + break_after)]) for i in range(0, len(value), break_after)])
-    )
+    return options.get("system.security-email") or options.get("system.admin-email")
 
 
 @register.filter
 def is_url(value):
-    if not isinstance(value, six.string_types):
+    if not isinstance(value, str):
         return False
-    if not value.startswith(('http://', 'https://')):
+    if not value.startswith(("http://", "https://")):
         return False
-    if ' ' in value:
+    if " " in value:
         return False
     return True
 
 
 @register.filter
 def absolute_value(value):
-    return abs(int(value) if isinstance(value, six.integer_types) else float(value))
+    return abs(int(value) if isinstance(value, int) else float(value))
 
 
 @register.filter
@@ -168,70 +161,64 @@ def as_sorted(value):
 def small_count(v, precision=1):
     if not v:
         return 0
-    z = [
-        (1000000000, _('b')),
-        (1000000, _('m')),
-        (1000, _('k')),
-    ]
+    z = [(1000000000, _("b")), (1000000, _("m")), (1000, _("k"))]
     v = int(v)
     for x, y in z:
         o, p = divmod(v, x)
         if o:
-            if len(six.text_type(o)) > 2 or not p:
-                return '%d%s' % (o, y)
-            return (u'%.{}f%s'.format(precision)) % (v / float(x), y)
+            if len(str(o)) > 2 or not p:
+                return "%d%s" % (o, y)
+            return (f"%.{precision}f%s") % (v / float(x), y)
     return v
 
 
 @register.filter
 def as_tag_alias(v):
-    return {
-        'sentry:release': 'release',
-        'sentry:dist': 'dist',
-        'sentry:user': 'user',
-    }.get(v, v)
+    return {"sentry:release": "release", "sentry:dist": "dist", "sentry:user": "user"}.get(v, v)
 
 
 @register.simple_tag(takes_context=True)
 def serialize(context, value):
-    value = serialize_func(value, context['request'].user)
+    value = serialize_func(value, context["request"].user)
     return json.dumps_htmlsafe(value)
 
 
 @register.simple_tag(takes_context=True)
 def get_sentry_version(context):
     import sentry
+
     current = sentry.VERSION
 
-    latest = options.get('sentry:latest_version') or current
-    update_available = Version(latest) > Version(current)
+    latest = options.get("sentry:latest_version") or current
+    update_available = parse_version(latest) > parse_version(current)
     build = sentry.__build__ or current
 
-    context['sentry_version'] = SentryVersion(current, latest, update_available, build)
-    return ''
+    context["sentry_version"] = SentryVersion(current, latest, update_available, build)
+    return ""
 
 
 @register.filter
 def timesince(value, now=None):
-    from django.template.defaultfilters import timesince
+    from django.utils.timesince import timesince
+
     if now is None:
-        now = timezone.now()
+        now = django_timezone.now()
     if not value:
-        return _('never')
+        return _("never")
     if value < (now - timedelta(days=5)):
         return value.date()
-    value = (' '.join(timesince(value, now).split(' ')[0:2])).strip(',')
-    if value == _('0 minutes'):
-        return _('just now')
-    if value == _('1 day'):
-        return _('yesterday')
-    return _('%s ago') % value
+    value = (" ".join(timesince(value, now).split(" ")[0:2])).strip(",")
+    if value == _("0 minutes"):
+        return _("just now")
+    if value == _("1 day"):
+        return _("yesterday")
+    return _("%s ago") % value
 
 
 @register.filter
 def duration(value):
     if not value:
-        return '0s'
+        return "0s"
     # value is assumed to be in ms
     value = value / 1000.0
     hours, minutes, seconds = 0, 0, 0
@@ -244,20 +231,21 @@ def duration(value):
     seconds = value
     output = []
     if hours:
-        output.append('%dh' % hours)
+        output.append("%dh" % hours)
     if minutes:
-        output.append('%dm' % minutes)
+        output.append("%dm" % minutes)
     if seconds > 1:
-        output.append('%0.2fs' % seconds)
+        output.append("%0.2fs" % seconds)
     elif seconds:
-        output.append('%dms' % (seconds * 1000))
-    return ''.join(output)
+        output.append("%dms" % (seconds * 1000))
+    return "".join(output)
 
 
 @register.filter
 def date(dt, arg=None):
     from django.template.defaultfilters import date
-    if not timezone.is_aware(dt):
+
+    if isinstance(dt, datetime) and not django_timezone.is_aware(dt):
         dt = dt.replace(tzinfo=timezone.utc)
     return date(dt, arg)
 
@@ -265,29 +253,29 @@ def date(dt, arg=None):
 @register.simple_tag
 def percent(value, total, format=None):
     if not (value and total):
-        result = 0
+        result = 0.0
     else:
         result = int(value) / float(total) * 100
 
     if format is None:
         return int(result)
     else:
-        return ('%%%s' % format) % result
+        return ("%%%s" % format) % result
 
 
 @register.filter
-def titlize(value):
-    return value.replace('_', ' ').title()
+def titleize(value):
+    return value.replace("_", " ").title()
 
 
 @register.filter
-def split(value, delim=''):
+def split(value, delim=""):
     return value.split(delim)
 
 
 @register.filter
-def urlquote(value, safe=''):
-    return quote(value.encode('utf8'), safe)
+def urlquote(value, safe=""):
+    return quote(value.encode("utf8"), safe)
 
 
 @register.filter
@@ -296,30 +284,33 @@ def basename(value):
 
 
 @register.filter
-def list_organizations(user):
-    return Organization.objects.get_for_user(user)
-
-
-@register.filter
-def count_pending_access_requests(organization):
-    from sentry.models import OrganizationAccessRequest
-
-    return OrganizationAccessRequest.objects.filter(
-        team__organization=organization,
-    ).count()
-
-
-@register.filter
 def soft_break(value, length):
     return _soft_break(
-        value,
-        length,
-        functools.partial(soft_hyphenate, length=max(length // 10, 10)),
+        value, length, functools.partial(soft_hyphenate, length=max(length // 10, 10))
     )
 
 
-@register.assignment_tag
+@register.simple_tag
 def random_int(a, b=None):
     if b is None:
         a, b = 0, a
     return randint(a, b)
+
+
+@register.filter
+def get_item(dictionary, key):
+    return dictionary.get(key, "")
+
+
+@register.filter
+@stringfilter
+def sanitize_periods(value):
+    """
+    Primarily used in email templates when a field may contain a domain name to prevent
+    email clients from creating a clickable link to the domain.
+    """
+    word_joiner = "\u2060"
+
+    # Adding the Unicode character before every period
+    output_string = value.replace(".", word_joiner + ".")
+    return output_string

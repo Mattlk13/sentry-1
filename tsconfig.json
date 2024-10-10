@@ -1,22 +1,7 @@
 {
-  "extends": "./node_modules/@sentry/typescript/tsconfig.json",
+  "extends": "./config/tsconfig.base.json",
   "compilerOptions": {
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
-    "strict": true,
-    "declaration": false,
-    "declarationMap": false,
-    "allowJs": false,
-    "noImplicitAny": false,
-    "esModuleInterop": true,
-    "module": "commonjs",
-    "jsx": "react",
-    "baseUrl": ".",
-    "outDir": "src/sentry/static/sentry/dist",
-    "paths": {
-      "app/*": ["src/sentry/static/sentry/app/*"]
-    },
-    "plugins": [{"name": "typescript-styled-plugin"}]
+    "allowJs": true
   },
-  "include": ["src"]
+  "include": [".eslintrc.js", "static/app", "tests/js", "config", "scripts"]
 }

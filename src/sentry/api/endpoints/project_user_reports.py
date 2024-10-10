@@ -1,112 +1,104 @@
-from __future__ import absolute_import
+from datetime import UTC, datetime, timedelta
+from typing import NotRequired, TypedDict
 
-from datetime import timedelta
-from django.db import IntegrityError, transaction
-from django.utils import timezone
 from rest_framework import serializers
-from uuid import uuid4
+from rest_framework.request import Request
+from rest_framework.response import Response
 
+from sentry import quotas
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
 from sentry.api.authentication import DSNAuthentication
-from sentry.api.base import DocSection, EnvironmentMixin
+from sentry.api.base import EnvironmentMixin, region_silo_endpoint
 from sentry.api.bases.project import ProjectEndpoint
-from sentry.api.serializers import (
-    serialize,
-    UserReportWithGroupSerializer,
-)
+from sentry.api.helpers.user_reports import user_reports_filter_to_unresolved
 from sentry.api.paginator import DateTimePaginator
-from sentry.models import (
-    Environment,
-    Event,
-    EventUser,
-    Group,
-    GroupStatus,
-    ProjectKey,
-    UserReport)
-from sentry.signals import user_feedback_received
-from sentry.utils.apidocs import scenario, attach_scenarios
-
-
-@scenario('CreateUserFeedback')
-def create_user_feedback_scenario(runner):
-    with runner.isolated_project('Plain Proxy') as project:
-        runner.request(
-            method='POST',
-            path=u'/projects/{}/{}/user-feedback/'.format(runner.org.slug, project.slug),
-            data={
-                'name': 'Jane Smith',
-                'email': 'jane@example.com',
-                'comments': 'It broke!',
-                'event_id': uuid4().hex,
-            }
-        )
+from sentry.api.serializers import UserReportWithGroupSerializer, serialize
+from sentry.feedback.usecases.create_feedback import FeedbackCreationSource
+from sentry.ingest.userreport import Conflict, save_userreport
+from sentry.models.environment import Environment
+from sentry.models.projectkey import ProjectKey
+from sentry.models.userreport import UserReport
+from sentry.utils.dates import epoch
 
 
 class UserReportSerializer(serializers.ModelSerializer):
     class Meta:
         model = UserReport
-        fields = ('name', 'email', 'comments', 'event_id')
+        fields = ("name", "email", "comments", "event_id")
 
 
+class _PaginateKwargs(TypedDict):
+    post_query_filter: NotRequired[object]
+
+
+@region_silo_endpoint
 class ProjectUserReportsEndpoint(ProjectEndpoint, EnvironmentMixin):
+    owner = ApiOwner.FEEDBACK
+    publish_status = {
+        "GET": ApiPublishStatus.PRIVATE,  # TODO: deprecate
+        "POST": ApiPublishStatus.PRIVATE,  # TODO: deprecate
+    }
     authentication_classes = ProjectEndpoint.authentication_classes + (DSNAuthentication,)
-    doc_section = DocSection.PROJECTS
 
-    def get(self, request, project):
+    def get(self, request: Request, project) -> Response:
         """
         List a Project's User Feedback
         ``````````````````````````````
 
         Return a list of user feedback items within this project.
 
-        :pparam string organization_slug: the slug of the organization.
-        :pparam string project_slug: the slug of the project.
+        *This list does not include submissions from the [User Feedback Widget](https://docs.sentry.io/product/user-feedback/#user-feedback-widget). This is because it is based on an older format called User Reports - read more [here](https://develop.sentry.dev/application/feedback-architecture/#user-reports).*
+
+        :pparam string organization_id_or_slug: the id or slug of the organization.
+        :pparam string project_id_or_slug: the id or slug of the project.
         :auth: required
         """
-        # we dont allow read permission with DSNs
+        # we don't allow read permission with DSNs
         if isinstance(request.auth, ProjectKey):
             return self.respond(status=401)
 
+        paginate_kwargs: _PaginateKwargs = {}
         try:
-            environment = self._get_environment_from_request(
-                request,
-                project.organization_id,
-            )
+            environment = self._get_environment_from_request(request, project.organization_id)
         except Environment.DoesNotExist:
             queryset = UserReport.objects.none()
         else:
+            retention = quotas.backend.get_event_retention(organization=project.organization)
+            start = datetime.now(UTC) - timedelta(days=retention) if retention else epoch
             queryset = UserReport.objects.filter(
-                project=project,
-                group__isnull=False,
-            ).select_related('group')
+                project_id=project.id, group_id__isnull=False, date_added__gte=start
+            )
             if environment is not None:
-                queryset = queryset.filter(
-                    environment=environment,
-                )
+                queryset = queryset.filter(environment_id=environment.id)
 
-            status = request.GET.get('status', 'unresolved')
-            if status == 'unresolved':
-                queryset = queryset.filter(
-                    group__status=GroupStatus.UNRESOLVED,
-                )
+            status = request.GET.get("status", "unresolved")
+            if status == "unresolved":
+                paginate_kwargs["post_query_filter"] = user_reports_filter_to_unresolved
             elif status:
-                return self.respond({'status': 'Invalid status choice'}, status=400)
+                return self.respond({"status": "Invalid status choice"}, status=400)
 
         return self.paginate(
             request=request,
             queryset=queryset,
-            order_by='-date_added',
-            on_results=lambda x: serialize(x, request.user, UserReportWithGroupSerializer(
-                environment_func=self._get_environment_func(
-                    request, project.organization_id)
-            )),
+            order_by="-date_added",
+            on_results=lambda x: serialize(
+                x,
+                request.user,
+                UserReportWithGroupSerializer(
+                    environment_func=self._get_environment_func(request, project.organization_id)
+                ),
+            ),
             paginator_cls=DateTimePaginator,
+            **paginate_kwargs,
         )
 
-    @attach_scenarios([create_user_feedback_scenario])
-    def post(self, request, project):
+    def post(self, request: Request, project) -> Response:
         """
         Submit User Feedback
         ````````````````````
+
+        *This endpoint is DEPRECATED. We document it here for older SDKs and users who are still migrating to the [User Feedback Widget](https://docs.sentry.io/product/user-feedback/#user-feedback-widget) or [API](https://docs.sentry.io/platforms/javascript/user-feedback/#user-feedback-api)(multi-platform). If you are a new user, do not use this endpoint - unless you don't have a JS frontend, and your platform's SDK does not offer a feedback API.*
 
         Submit and associate user feedback with an issue.
 
@@ -119,15 +111,15 @@ class ProjectUserReportsEndpoint(ProjectEndpoint, EnvironmentMixin):
 
         Note: Feedback may be submitted with DSN authentication (see auth documentation).
 
-        :pparam string organization_slug: the slug of the organization.
-        :pparam string project_slug: the slug of the project.
+        :pparam string organization_id_or_slug: the id or slug of the organization.
+        :pparam string project_id_or_slug: the id or slug of the project.
         :auth: required
         :param string event_id: the event ID
         :param string name: user's name
         :param string email: user's email address
         :param string comments: comments supplied by user
         """
-        if hasattr(request.auth, 'project_id') and project.id != request.auth.project_id:
+        if hasattr(request.auth, "project_id") and project.id != request.auth.project_id:
             return self.respond(status=400)
 
         serializer = UserReportSerializer(data=request.data)
@@ -135,101 +127,22 @@ class ProjectUserReportsEndpoint(ProjectEndpoint, EnvironmentMixin):
             return self.respond(serializer.errors, status=400)
 
         report = serializer.validated_data
-
-        # XXX(dcramer): enforce case insensitivty by coercing this to a lowercase string
-        report['event_id'] = report['event_id'].lower()
-        report['project'] = project
-
-        # TODO(dcramer): we should probably create the user if they dont
-        # exist, and ideally we'd also associate that with the event
-        euser = self.find_event_user(report)
-        if euser and not euser.name and report['name']:
-            euser.update(name=report['name'])
-        if euser:
-            report['event_user_id'] = euser.id
-
-        event = Event.objects.from_event_id(report['event_id'], project.id)
-        if not event:
-            try:
-                report['group'] = Group.objects.from_event_id(project, report['event_id'])
-            except Group.DoesNotExist:
-                pass
-        else:
-            # if the event is more than 30 minutes old, we dont allow updates
-            # as it might be abusive
-            if event.datetime < timezone.now() - timedelta(minutes=30):
-                return self.respond(
-                    {'detail': 'Feedback for this event cannot be modified.'}, status=409)
-
-            report['environment'] = event.get_environment()
-            report['group'] = event.group
-
         try:
-            with transaction.atomic():
-                report_instance = UserReport.objects.create(**report)
-        except IntegrityError:
-            # There was a duplicate, so just overwrite the existing
-            # row with the new one. The only way this ever happens is
-            # if someone is messing around with the API, or doing
-            # something wrong with the SDK, but this behavior is
-            # more reasonable than just hard erroring and is more
-            # expected.
-            existing_report = UserReport.objects.get(
-                project=report['project'],
-                event_id=report['event_id'],
+            report_instance = save_userreport(
+                project, report, FeedbackCreationSource.USER_REPORT_DJANGO_ENDPOINT
             )
+        except Conflict as e:
+            return self.respond({"detail": str(e)}, status=409)
 
-            # if the existing report was submitted more than 5 minutes ago, we dont
-            # allow updates as it might be abusive (replay attacks)
-            if existing_report.date_added < timezone.now() - timedelta(minutes=5):
-                return self.respond(
-                    {'detail': 'Feedback for this event cannot be modified.'}, status=409)
+        if isinstance(request.auth, ProjectKey):
+            return self.respond(status=200)
 
-            existing_report.update(
-                name=report['name'],
-                email=report['email'],
-                comments=report['comments'],
-                date_added=timezone.now(),
-                event_user_id=euser.id if euser else None,
+        return self.respond(
+            serialize(
+                report_instance,
+                request.user,
+                UserReportWithGroupSerializer(
+                    environment_func=self._get_environment_func(request, project.organization_id)
+                ),
             )
-            report_instance = existing_report
-
-        else:
-            if report_instance.group:
-                report_instance.notify()
-
-        user_feedback_received.send(project=report_instance.project, group=report_instance.group, sender=self)
-
-        return self.respond(serialize(report_instance, request.user, UserReportWithGroupSerializer(
-            environment_func=self._get_environment_func(
-                request, project.organization_id)
-        )))
-
-    def find_event_user(self, report_data):
-        try:
-            event = Event.objects.get(
-                group_id=report_data.get('group_id'),
-                event_id=report_data['event_id'],
-            )
-        except Event.DoesNotExist:
-            if not report_data.get('email'):
-                return None
-            try:
-                return EventUser.objects.filter(
-                    project_id=report_data['project'].id,
-                    email=report_data['email'],
-                )[0]
-            except IndexError:
-                return None
-
-        tag = event.get_tag('sentry:user')
-        if not tag:
-            return None
-
-        try:
-            return EventUser.for_tags(
-                project_id=report_data['project'].id,
-                values=[tag],
-            )[tag]
-        except KeyError:
-            pass
+        )

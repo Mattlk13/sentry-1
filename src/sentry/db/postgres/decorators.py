@@ -1,8 +1,4 @@
-from __future__ import absolute_import
-
-import six
 import sys
-
 from functools import wraps
 
 from .exceptions import TransactionAborted
@@ -60,14 +56,15 @@ def capture_transaction_exceptions(func):
     """
 
     def raise_the_exception(conn, exc):
-        if 'current transaction is aborted, commands ignored until end of transaction block' in six.text_type(
-            exc
+        if (
+            "current transaction is aborted, commands ignored until end of transaction block"
+            in str(exc)
         ):
-            exc_info = getattr(conn, '_last_exception', None)
+            exc_info = getattr(conn, "_last_exception", None)
             if exc_info is None:
                 raise
             new_exc = TransactionAborted(sys.exc_info(), exc_info)
-            six.reraise(new_exc.__class__, new_exc, exc_info[2])
+            raise new_exc.with_traceback(exc_info[2])
 
         conn._last_exception = sys.exc_info()
         raise
@@ -82,7 +79,7 @@ def capture_transaction_exceptions(func):
     return inner
 
 
-def less_shitty_error_messages(func):
+def more_better_error_messages(func):
     """
     Wraps functions where the first param is a SQL statement and enforces
     any exceptions thrown will also contain the statement in the message.
@@ -93,11 +90,6 @@ def less_shitty_error_messages(func):
         try:
             return func(self, sql, *args, **kwargs)
         except Exception as e:
-            exc_info = sys.exc_info()
-            msg = u'{}\nSQL: {}'.format(
-                repr(e),
-                sql,
-            )
-            six.reraise(exc_info[0], exc_info[0](msg), exc_info[2])
+            raise type(e)(f"{e!r}\nSQL: {sql}").with_traceback(e.__traceback__)
 
     return inner

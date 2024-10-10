@@ -1,17 +1,16 @@
-from __future__ import absolute_import
-import six
-
-
-class AssistantManager(object):
+class AssistantManager:
     def __init__(self):
         self._guides = {}
 
     def add(self, guides):
-        for k, v in six.iteritems(guides):
-            self._guides[k] = v
+        for guide_key, id in guides.items():
+            self._guides[guide_key] = id
 
     def get_valid_ids(self):
-        return list(v['id'] for k, v in six.iteritems(self._guides))
+        return list(self._guides.values())
+
+    def get_guide_id(self, guide):
+        return self._guides.get(guide)
 
     def all(self):
         return self._guides

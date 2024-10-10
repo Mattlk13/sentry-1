@@ -1,25 +1,28 @@
-from __future__ import absolute_import
+from unittest.mock import patch
 
-from mock import patch
+import pytest
 
 from sentry.coreapi import APIUnauthorized
-from sentry.models import ApiApplication, ApiToken, SentryApp, SentryAppInstallation
-from sentry.mediators.token_exchange import GrantExchanger, Refresher
-from sentry.testutils import TestCase
+from sentry.mediators.token_exchange.refresher import Refresher
+from sentry.models.apiapplication import ApiApplication
+from sentry.models.apitoken import ApiToken
+from sentry.sentry_apps.models.sentry_app import SentryApp
+from sentry.sentry_apps.models.sentry_app_installation import SentryAppInstallation
+from sentry.sentry_apps.services.app import app_service
+from sentry.testutils.cases import TestCase
+from sentry.testutils.silo import control_silo_test
 
 
+@control_silo_test
 class TestRefresher(TestCase):
     def setUp(self):
-        self.install = self.create_sentry_app_installation()
-        self.client_id = self.install.sentry_app.application.client_id
-        self.user = self.install.sentry_app.proxy_user
+        self.orm_install = self.create_sentry_app_installation()
+        self.client_id = self.orm_install.sentry_app.application.client_id
+        self.user = self.orm_install.sentry_app.proxy_user
 
-        self.token = GrantExchanger.run(
-            install=self.install,
-            code=self.install.api_grant.code,
-            client_id=self.client_id,
-            user=self.user,
-        )
+        self.token = self.orm_install.api_token
+
+        self.install = app_service.get_many(filter=dict(installation_ids=[self.orm_install.id]))[0]
 
         self.refresher = Refresher(
             install=self.install,
@@ -39,43 +42,41 @@ class TestRefresher(TestCase):
         self.refresher.call()
         assert not ApiToken.objects.filter(id=self.token.id).exists()
 
-    @patch('sentry.mediators.token_exchange.Validator.run')
+    @patch("sentry.mediators.token_exchange.Validator.run")
     def test_validates_generic_token_exchange_requirements(self, validator):
         self.refresher.call()
 
         validator.assert_called_once_with(
-            install=self.install,
-            client_id=self.client_id,
-            user=self.user,
+            install=self.install, client_id=self.client_id, user=self.user
         )
 
     def test_validates_token_belongs_to_sentry_app(self):
-        self.refresher.refresh_token = ApiToken.objects.create(
+        refresh_token = ApiToken.objects.create(
             user=self.user,
-            application=ApiApplication.objects.create(
-                owner_id=self.create_user().id,
-            ),
+            application=ApiApplication.objects.create(owner_id=self.create_user().id),
         ).refresh_token
+        assert refresh_token is not None
+        self.refresher.refresh_token = refresh_token
 
-        with self.assertRaises(APIUnauthorized):
+        with pytest.raises(APIUnauthorized):
             self.refresher.call()
 
-    @patch('sentry.models.ApiToken.objects.get', side_effect=ApiToken.DoesNotExist)
+    @patch("sentry.models.ApiToken.objects.get", side_effect=ApiToken.DoesNotExist)
     def test_token_must_exist(self, _):
-        with self.assertRaises(APIUnauthorized):
+        with pytest.raises(APIUnauthorized):
             self.refresher.call()
 
-    @patch('sentry.models.ApiApplication.objects.get', side_effect=ApiApplication.DoesNotExist)
+    @patch("sentry.models.ApiApplication.objects.get", side_effect=ApiApplication.DoesNotExist)
     def test_api_application_must_exist(self, _):
-        with self.assertRaises(APIUnauthorized):
+        with pytest.raises(APIUnauthorized):
             self.refresher.call()
 
-    @patch('sentry.models.ApiApplication.sentry_app', side_effect=SentryApp.DoesNotExist)
+    @patch("sentry.models.ApiApplication.sentry_app", side_effect=SentryApp.DoesNotExist)
     def test_sentry_app_must_exist(self, _):
-        with self.assertRaises(APIUnauthorized):
+        with pytest.raises(APIUnauthorized):
             self.refresher.call()
 
-    @patch('sentry.analytics.record')
+    @patch("sentry.analytics.record")
     def test_records_analytics(self, record):
         Refresher.run(
             install=self.install,
@@ -85,7 +86,7 @@ class TestRefresher(TestCase):
         )
 
         record.assert_called_with(
-            'sentry_app.token_exchanged',
+            "sentry_app.token_exchanged",
             sentry_app_installation_id=self.install.id,
-            exchange_type='refresh',
+            exchange_type="refresh",
         )

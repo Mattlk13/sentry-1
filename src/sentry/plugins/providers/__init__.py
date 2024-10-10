@@ -1,5 +1,9 @@
-from __future__ import absolute_import
+__all__ = (
+    "ProviderMixin",
+    "IntegrationRepositoryProvider",
+    "RepositoryProvider",
+)
 
-from sentry.utils.imports import import_submodules
-
-import_submodules(globals(), __name__, __path__)
+from .base import ProviderMixin
+from .integration_repository import IntegrationRepositoryProvider
+from .repository import RepositoryProvider

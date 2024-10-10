@@ -3,8 +3,6 @@
 {% load crispy_forms_tags %}
 {% load i18n %}
 
-{% block global_sidebar %}{% endblock %}
-
 {% block wrapperclass %}narrow auth org-login{% endblock %}
 
 {% block content %}
@@ -12,7 +10,7 @@
 
 <div class="box">
   <div class="auth-sidebar">
-    <a href="/">
+    <a href="https://sentry.io/welcome/">
       <span class="icon-sentry-logo"></span>
     </a>
   </div>
@@ -20,6 +18,11 @@
     {% block auth_container %}
       <div class="auth-container p-y-2">
         {% block auth_main %}{% endblock %}
+        <p class="m-t-1">
+          {% blocktrans %}
+            Need help with your account?  Click <a class="help-center-link" href="https://sentry.zendesk.com/hc/en-us">here</a> to check out our help center.
+          {% endblocktrans %}
+        </p>
       </div>
     {% endblock %}
   </section>

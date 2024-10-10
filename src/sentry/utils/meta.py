@@ -1,10 +1,19 @@
-from __future__ import absolute_import
+from collections.abc import Mapping
+from typing import Literal, NotRequired, TypedDict
 
-import collections
-import six
+RemarkType = Literal["a", "x", "s", "m", "p", "e"]
 
 
-class Meta(object):
+class Remark(TypedDict):
+    rule_id: str
+    type: RemarkType
+    # Range start is a byte offset
+    range_start: NotRequired[int]
+    # Range end is a byte offset
+    range_end: NotRequired[int]
+
+
+class Meta:
     """
     A lazy view to detached validation and normalization meta data. It allows to
     safely traverse the meta tree and create a deep path lazily. Use ``enter``
@@ -27,14 +36,14 @@ class Meta(object):
         Enters into sub meta data at the specified path. This always returns a
         new ``Meta`` object, regardless whether the path already exists.
         """
-        return Meta(self._meta, path=self._path + map(six.text_type, path))
+        return Meta(self._meta, path=self._path + [str(p) for p in path])
 
     @property
     def path(self):
         """
         Returns the full path of this meta instance, joined with dots (".").
         """
-        return '.'.join(self._path)
+        return ".".join(self._path)
 
     def raw(self):
         """
@@ -57,7 +66,7 @@ class Meta(object):
         It is not safe to mutate the return value since it might be detached
         from the actual meta tree.
         """
-        return self.raw().get('') or {}
+        return self.raw().get("") or {}
 
     def create(self):
         """
@@ -65,7 +74,7 @@ class Meta(object):
         recursively creates the entire parent tree.
         """
         meta = self._meta
-        for key in self._path + ['']:
+        for key in self._path + [""]:
             if key not in meta or meta[key] is None:
                 meta[key] = {}
             meta = meta[key]
@@ -85,11 +94,11 @@ class Meta(object):
             return
 
         meta = self.create()
-        err = meta.get('err')
+        err = meta.get("err")
         meta.update(other)
 
-        if err and other.get('err'):
-            meta['err'] = err + other['err']
+        if err and other.get("err"):
+            meta["err"] = err + other["err"]
 
         return meta
 
@@ -101,10 +110,7 @@ class Meta(object):
          - ``type`` is the error constant also used in EventError
          - ``data`` a dictionary of additional error infos
         """
-        return (
-            ([err, {}] if isinstance(err, six.string_types) else err)
-            for err in self.get().get('err') or ()
-        )
+        return (([err, {}] if isinstance(err, str) else err) for err in self.get().get("err") or ())
 
     def get_event_errors(self):
         """
@@ -113,17 +119,17 @@ class Meta(object):
         """
 
         errors = []
-        value = self.get().get('val')
+        value = self.get().get("val")
 
         for error, data in self.iter_errors():
             eventerror = dict(data)
-            eventerror['type'] = error
+            eventerror["type"] = error
 
             if self._path:
-                eventerror['name'] = '.'.join(self._path)
+                eventerror["name"] = ".".join(self._path)
 
             if value is not None:
-                eventerror['value'] = value
+                eventerror["value"] = value
                 value = None
 
             errors.append(eventerror)
@@ -144,21 +150,53 @@ class Meta(object):
         with the entire parent tree.
         """
         meta = self.create()
-        if 'err' not in meta or meta['err'] is None:
-            meta['err'] = []
+        if "err" not in meta or meta["err"] is None:
+            meta["err"] = []
 
-        error = six.text_type(error)
-        if isinstance(data, collections.Mapping):
+        error = str(error)
+        if isinstance(data, Mapping):
             error = [error, dict(data)]
-        meta['err'].append(error)
+        meta["err"].append(error)
 
         if value is not None:
-            meta['val'] = value
+            meta["val"] = value
+
+    def add_remark(self, rem: Remark, value=None):
+        """
+        Adds a remark to the meta data at the current path.
+
+        If an optional ``value`` is specified, it is attached as original value
+        into the meta data. Note that there is only one original value, not one
+        per remark.
+
+        `range_start` and `range_end` in `rem` are byte offsets.
+
+        If no meta data entry exists for the current path, it is created, along
+        with the entire parent tree.
+        """
+        meta = self.create()
+        if "rem" not in meta or meta["rem"] is None:
+            meta["rem"] = []
+
+        rem_list: list[str | int] = [rem["rule_id"], rem["type"]]
+
+        range_start = rem.get("range_start")
+        if range_start is not None:
+            rem_list.append(range_start)
+
+        range_end = rem.get("range_end")
+        if range_end is not None:
+            rem_list.append(range_end)
+
+        meta["rem"].append(rem_list)
+
+        if value is not None:
+            meta["val"] = value
 
     def __iter__(self):
         """
         Iterates all child meta entries that potentially have errors set.
         """
         for key in self.raw():
-            if key != '':
+            if key != "":
                 yield self.enter(key)

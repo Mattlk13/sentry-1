@@ -1,19 +1,27 @@
-from __future__ import absolute_import, print_function
-
 from uuid import uuid4
 
-from sentry.utils.redis import clusters
+import sentry_sdk
+
 from sentry.utils.json import dumps, loads
+from sentry.utils.redis import clusters
 
 EXPIRATION_TTL = 10 * 60
 
 
-class RedisSessionStore(object):
+class RedisSessionStore:
     """
-    RedisSessionStore provides a convinience object, which when initalized will
+    RedisSessionStore provides a convenience object, which when initialized will
     store attributes assigned to it into redis. The redis key is stored into
     the request session. Useful for storing data too large to be stored into
     the session cookie.
+
+    The attributes to be backed by Redis must be declared in a subclass using
+    the `redis_property` function. Do not instantiate RedisSessionStore without
+    extending it to add properties. For example:
+
+    >>> class HotDogSessionStore(RedisSessionStore):
+    >>>     bun = redis_property("bun")
+    >>>     condiment = redis_property("condiment")
 
     NOTE: Assigning attributes immediately saves their value back into the
           redis key assigned for this store. Be aware of the multiple
@@ -40,30 +48,37 @@ class RedisSessionStore(object):
     modified within the provided ttl.
     """
 
+    redis_namespace = "session-cache"
+
     def __init__(self, request, prefix, ttl=EXPIRATION_TTL):
-        self.__dict__['request'] = request
-        self.__dict__['prefix'] = prefix
-        self.__dict__['ttl'] = ttl
+        self.request = request
+        self.prefix = prefix
+        self.ttl = ttl
 
     @property
     def _client(self):
-        return clusters.get('default').get_local_client_for_key(self.redis_key)
+        return clusters.get("default").get_local_client_for_key(self.redis_key)
 
     @property
     def session_key(self):
-        return u'store:{}'.format(self.prefix)
+        return f"store:{self.prefix}"
 
     @property
     def redis_key(self):
         return self.request.session.get(self.session_key)
 
+    def mark_session(self):
+        # Subclasses may override to mark session as modified
+        pass
+
     def regenerate(self, initial_state=None):
         if initial_state is None:
             initial_state = {}
 
-        redis_key = u'session-cache:{}:{}'.format(self.prefix, uuid4().hex)
+        redis_key = f"{self.redis_namespace}:{self.prefix}:{uuid4().hex}"
 
         self.request.session[self.session_key] = redis_key
+        self.mark_session()
 
         value = dumps(initial_state)
         self._client.setex(redis_key, self.ttl, value)
@@ -73,10 +88,13 @@ class RedisSessionStore(object):
             return
 
         self._client.delete(self.redis_key)
-        del self.request.session[self.session_key]
+
+        session = self.request.session
+        del session[self.session_key]
+        self.mark_session()
 
     def is_valid(self):
-        return self.redis_key and self._client.get(self.redis_key)
+        return bool(self.redis_key and self.get_state() is not None)
 
     def get_state(self):
         if not self.redis_key:
@@ -86,21 +104,31 @@ class RedisSessionStore(object):
         if not state_json:
             return None
 
-        return loads(state_json)
+        try:
+            return loads(state_json)
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+        return None
 
-    def __getattr__(self, key):
-        state = self.get_state()
+
+def redis_property(key: str):
+    """Declare a property backed by Redis on a RedisSessionStore class."""
+
+    def getter(store: "RedisSessionStore"):
+        state = store.get_state()
 
         try:
             return state[key] if state else None
         except KeyError as e:
             raise AttributeError(e)
 
-    def __setattr__(self, key, value):
-        state = self.get_state()
+    def setter(store: "RedisSessionStore", value):
+        state = store.get_state()
 
         if state is None:
             return
 
         state[key] = value
-        self._client.setex(self.redis_key, self.ttl, dumps(state))
+        store._client.setex(store.redis_key, store.ttl, dumps(state))
+
+    return property(getter, setter)

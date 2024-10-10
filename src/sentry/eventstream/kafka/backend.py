@@ -1,34 +1,201 @@
-from __future__ import absolute_import
+from __future__ import annotations
 
 import logging
-import six
+import time
+from collections.abc import Mapping, MutableMapping, Sequence
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
-from confluent_kafka import OFFSET_INVALID, TopicPartition
-from django.conf import settings
-from django.utils.functional import cached_property
+from confluent_kafka import KafkaError
+from confluent_kafka import Message as KafkaMessage
+from confluent_kafka import Producer
 
-from sentry.eventstream.kafka.consumer import SynchronizedConsumer
-from sentry.eventstream.kafka.protocol import get_task_kwargs_for_message
-from sentry.eventstream.snuba import SnubaProtocolEventStream
-from sentry.utils import json, kafka, metrics
-
+from sentry import options
+from sentry.conf.types.kafka_definition import Topic
+from sentry.eventstream.base import EventStreamEventType, GroupStates
+from sentry.eventstream.snuba import KW_SKIP_SEMANTIC_PARTITIONING, SnubaProtocolEventStream
+from sentry.killswitches import killswitch_matches_context
+from sentry.utils import json
+from sentry.utils.kafka_config import get_kafka_producer_cluster_options, get_topic_definition
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from sentry.eventstore.models import Event, GroupEvent
+
 
 class KafkaEventStream(SnubaProtocolEventStream):
-    def __init__(self, **options):
-        self.topic = settings.KAFKA_TOPICS[settings.KAFKA_EVENTS]['topic']
+    def __init__(self, **options: Any) -> None:
+        super().__init__(**options)
+        self.topic = Topic.EVENTS
+        self.transactions_topic = Topic.TRANSACTIONS
+        self.issue_platform_topic = Topic.EVENTSTREAM_GENERIC
+        self.__producers: MutableMapping[Topic, Producer] = {}
+        self.error_last_logged_time: int | None = None
 
-    @cached_property
-    def producer(self):
-        return kafka.producers.get(settings.KAFKA_EVENTS)
+    def get_transactions_topic(self, project_id: int) -> Topic:
+        return self.transactions_topic
 
-    def delivery_callback(self, error, message):
+    def get_producer(self, topic: Topic) -> Producer:
+        if topic not in self.__producers:
+            cluster_name = get_topic_definition(topic)["cluster"]
+            cluster_options = get_kafka_producer_cluster_options(cluster_name)
+            self.__producers[topic] = Producer(cluster_options)
+
+        return self.__producers[topic]
+
+    def delivery_callback(self, error: KafkaError | None, message: KafkaMessage) -> None:
+        now = int(time.time())
         if error is not None:
-            logger.warning('Could not publish message (error: %s): %r', error, message)
+            if self.error_last_logged_time is None or now > self.error_last_logged_time + 60:
+                self.error_last_logged_time = now
+                logger.error("Could not publish message (error: %s): %r", error, message)
 
-    def _send(self, project_id, _type, extra_data=(), asynchronous=True):
+    def _get_headers_for_insert(
+        self,
+        event: Event | GroupEvent,
+        is_new: bool,
+        is_regression: bool,
+        is_new_group_environment: bool,
+        primary_hash: str | None,
+        received_timestamp: float | datetime,
+        skip_consume: bool,
+        group_states: GroupStates | None = None,
+    ) -> MutableMapping[str, str]:
+        # HACK: We are putting all this extra information that is required by the
+        # post process forwarder into the headers so we can skip parsing entire json
+        # messages. The post process forwarder is currently bound to a single core.
+        # Once we are able to parallelize the JSON parsing and other transformation
+        # steps being done there we may want to remove this hack.
+        def encode_bool(value: bool | None) -> str:
+            if value is None:
+                value = False
+            return str(int(value))
+
+        def encode_list(value: Sequence[Any]) -> str:
+            return json.dumps(value)
+
+        # we strip `None` values here so later in the pipeline they can be
+        # cleanly encoded without nullability checks
+        def strip_none_values(value: Mapping[str, str | None]) -> MutableMapping[str, str]:
+            return {key: value for key, value in value.items() if value is not None}
+
+        send_new_headers = options.get("eventstream:kafka-headers")
+
+        if send_new_headers is True:
+            return strip_none_values(
+                {
+                    "Received-Timestamp": str(received_timestamp),
+                    "event_id": str(event.event_id),
+                    "project_id": str(event.project_id),
+                    "occurrence_id": self._get_occurrence_data(event).get("id"),
+                    "group_id": str(event.group_id) if event.group_id is not None else None,
+                    "primary_hash": str(primary_hash) if primary_hash is not None else None,
+                    "is_new": encode_bool(is_new),
+                    "is_new_group_environment": encode_bool(is_new_group_environment),
+                    "is_regression": encode_bool(is_regression),
+                    "skip_consume": encode_bool(skip_consume),
+                    "group_states": encode_list(group_states) if group_states is not None else None,
+                    "queue": self._get_queue_for_post_process(event),
+                }
+            )
+        else:
+            return {
+                **super()._get_headers_for_insert(
+                    event,
+                    is_new,
+                    is_regression,
+                    is_new_group_environment,
+                    primary_hash,
+                    received_timestamp,
+                    skip_consume,
+                ),
+            }
+
+    def insert(
+        self,
+        event: Event | GroupEvent,
+        is_new: bool,
+        is_regression: bool,
+        is_new_group_environment: bool,
+        primary_hash: str | None,
+        received_timestamp: float | datetime,
+        skip_consume: bool = False,
+        group_states: GroupStates | None = None,
+        **kwargs: Any,
+    ) -> None:
+
+        event_type = self._get_event_type(event)
+        if event.get_tag("sample_event"):
+            logger.info(
+                "insert: inserting event in KafkaEventStream",
+                extra={
+                    "event.id": event.event_id,
+                    "project_id": event.project_id,
+                    "sample_event": True,
+                    "event_type": event_type.value,
+                },
+            )
+
+        assign_partitions_randomly = (
+            (event_type == EventStreamEventType.Generic)
+            or (event_type == EventStreamEventType.Transaction)
+            or killswitch_matches_context(
+                "kafka.send-project-events-to-random-partitions",
+                {"project_id": event.project_id, "message_type": event_type.value},
+            )
+        )
+
+        if assign_partitions_randomly:
+            kwargs[KW_SKIP_SEMANTIC_PARTITIONING] = True
+
+        if event.get_tag("sample_event"):
+            logger.info(
+                "insert: inserting event in SnubaProtocolEventStream",
+                extra={
+                    "event.id": event.event_id,
+                    "project_id": event.project_id,
+                    "sample_event": True,
+                },
+            )
+            kwargs["asynchronous"] = False
+
+        super().insert(
+            event,
+            is_new,
+            is_regression,
+            is_new_group_environment,
+            primary_hash,
+            received_timestamp,
+            skip_consume,
+            group_states,
+            **kwargs,
+        )
+
+    def _send(
+        self,
+        project_id: int,
+        _type: str,
+        extra_data: tuple[Any, ...] = (),
+        asynchronous: bool = True,
+        headers: MutableMapping[str, str] | None = None,
+        skip_semantic_partitioning: bool = False,
+        event_type: EventStreamEventType = EventStreamEventType.Error,
+    ) -> None:
+        if headers is None:
+            headers = {}
+        headers["operation"] = _type
+        headers["version"] = str(self.EVENT_PROTOCOL_VERSION)
+
+        if event_type == EventStreamEventType.Transaction:
+            topic = self.get_transactions_topic(project_id)
+        elif event_type == EventStreamEventType.Generic:
+            topic = self.issue_platform_topic
+        else:
+            topic = self.topic
+
+        producer = self.get_producer(topic)
+
         # Polling the producer is required to ensure callbacks are fired. This
         # means that the latency between a message being delivered (or failing
         # to be delivered) and the corresponding callback being fired is
@@ -39,167 +206,27 @@ class KafkaEventStream(SnubaProtocolEventStream):
         # a heartbeat for the purposes of any sort of session expiration.)
         # Note that this call to poll() is *only* dealing with earlier
         # asynchronous produce() calls from the same process.
-        self.producer.poll(0.0)
+        producer.poll(0.0)
 
         assert isinstance(extra_data, tuple)
-        key = six.text_type(project_id)
+
+        real_topic = get_topic_definition(topic)["real_topic_name"]
 
         try:
-            self.producer.produce(
-                topic=self.topic,
-                key=key.encode('utf-8'),
-                value=json.dumps(
-                    (self.EVENT_PROTOCOL_VERSION, _type) + extra_data
-                ),
+            producer.produce(
+                topic=real_topic,
+                key=str(project_id).encode("utf-8") if not skip_semantic_partitioning else None,
+                value=json.dumps((self.EVENT_PROTOCOL_VERSION, _type) + extra_data),
                 on_delivery=self.delivery_callback,
+                headers=[(k, v.encode("utf-8")) for k, v in headers.items()],
             )
         except Exception as error:
-            logger.error('Could not publish message: %s', error, exc_info=True)
+            logger.exception("Could not publish message: %s", error)
             return
 
         if not asynchronous:
             # flush() is a convenience method that calls poll() until len() is zero
-            self.producer.flush()
+            producer.flush()
 
-    def requires_post_process_forwarder(self):
+    def requires_post_process_forwarder(self) -> bool:
         return True
-
-    def run_post_process_forwarder(self, consumer_group, commit_log_topic,
-                                   synchronize_commit_group, commit_batch_size=100, initial_offset_reset='latest'):
-        logger.debug('Starting post-process forwarder...')
-
-        cluster_name = settings.KAFKA_TOPICS[settings.KAFKA_EVENTS]['cluster']
-        bootstrap_servers = settings.KAFKA_CLUSTERS[cluster_name]['bootstrap.servers']
-
-        consumer = SynchronizedConsumer(
-            bootstrap_servers=bootstrap_servers,
-            consumer_group=consumer_group,
-            commit_log_topic=commit_log_topic,
-            synchronize_commit_group=synchronize_commit_group,
-            initial_offset_reset=initial_offset_reset,
-        )
-
-        owned_partition_offsets = {}
-
-        def commit(partitions):
-            results = consumer.commit(offsets=partitions, asynchronous=False)
-
-            errors = filter(lambda i: i.error is not None, results)
-            if errors:
-                raise Exception(
-                    'Failed to commit %s/%s partitions: %r' %
-                    (len(errors), len(partitions), errors))
-
-            return results
-
-        def on_assign(consumer, partitions):
-            logger.debug('Received partition assignment: %r', partitions)
-
-            for i in partitions:
-                if i.offset == OFFSET_INVALID:
-                    updated_offset = None
-                elif i.offset < 0:
-                    raise Exception(
-                        'Received unexpected negative offset during partition assignment: %r' %
-                        (i,))
-                else:
-                    updated_offset = i.offset
-
-                key = (i.topic, i.partition)
-                previous_offset = owned_partition_offsets.get(key, None)
-                if previous_offset is not None and previous_offset != updated_offset:
-                    logger.warning(
-                        'Received new offset for owned partition %r, will overwrite previous stored offset %r with %r.',
-                        key,
-                        previous_offset,
-                        updated_offset)
-
-                owned_partition_offsets[key] = updated_offset
-
-        def on_revoke(consumer, partitions):
-            logger.debug('Revoked partition assignment: %r', partitions)
-
-            offsets_to_commit = []
-
-            for i in partitions:
-                key = (i.topic, i.partition)
-
-                try:
-                    offset = owned_partition_offsets.pop(key)
-                except KeyError:
-                    logger.warning(
-                        'Received unexpected partition revocation for unowned partition: %r',
-                        i,
-                        exc_info=True)
-                    continue
-
-                if offset is None:
-                    logger.debug('Skipping commit of unprocessed partition: %r', i)
-                    continue
-
-                offsets_to_commit.append(TopicPartition(i.topic, i.partition, offset))
-
-            if offsets_to_commit:
-                logger.debug(
-                    'Committing offset(s) for %s revoked partition(s): %r',
-                    len(offsets_to_commit),
-                    offsets_to_commit)
-                commit(offsets_to_commit)
-
-        consumer.subscribe(
-            [self.topic],
-            on_assign=on_assign,
-            on_revoke=on_revoke,
-        )
-
-        def commit_offsets():
-            offsets_to_commit = []
-            for (topic, partition), offset in owned_partition_offsets.items():
-                if offset is None:
-                    logger.debug('Skipping commit of unprocessed partition: %r', (topic, partition))
-                    continue
-
-                offsets_to_commit.append(TopicPartition(topic, partition, offset))
-
-            if offsets_to_commit:
-                logger.debug(
-                    'Committing offset(s) for %s owned partition(s): %r',
-                    len(offsets_to_commit),
-                    offsets_to_commit)
-                commit(offsets_to_commit)
-
-        try:
-            i = 0
-            while True:
-                message = consumer.poll(0.1)
-                if message is None:
-                    continue
-
-                error = message.error()
-                if error is not None:
-                    raise Exception(error)
-
-                key = (message.topic(), message.partition())
-                if key not in owned_partition_offsets:
-                    logger.warning('Skipping message for unowned partition: %r', key)
-                    continue
-
-                i = i + 1
-                owned_partition_offsets[key] = message.offset() + 1
-
-                with metrics.timer('eventstream.duration', instance='get_task_kwargs_for_message'):
-                    task_kwargs = get_task_kwargs_for_message(message.value())
-
-                if task_kwargs is not None:
-                    with metrics.timer('eventstream.duration', instance='dispatch_post_process_group_task'):
-                        self._dispatch_post_process_group_task(**task_kwargs)
-
-                if i % commit_batch_size == 0:
-                    commit_offsets()
-        except KeyboardInterrupt:
-            pass
-
-        logger.debug('Committing offsets and closing consumer...')
-        commit_offsets()
-
-        consumer.close()

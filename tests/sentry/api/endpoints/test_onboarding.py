@@ -1,28 +1,27 @@
-from __future__ import absolute_import
-
-from django.core.urlresolvers import reverse
-
-from sentry.models import (OrganizationOnboardingTask, OnboardingTask, OnboardingTaskStatus)
-from sentry.testutils import APITestCase
+from sentry.models.organizationonboardingtask import (
+    OnboardingTask,
+    OnboardingTaskStatus,
+    OrganizationOnboardingTask,
+)
+from sentry.testutils.cases import APITestCase
 
 
 class SkipOnboardingTaskTest(APITestCase):
-    def test_skip_onboarding_task(self):
-        self.login_as(user=self.user)
+    endpoint = "sentry-api-0-organization-onboardingtasks"
+    method = "post"
 
-        organization = self.create_organization(name='foo', owner=self.user)
-        url = reverse(
-            'sentry-api-0-organization-onboardingtasks',
-            kwargs={'organization_slug': organization.slug}
-        )
+    def setUp(self):
+        super().setUp()
+        self.login_as(self.user)
 
-        resp = self.client.post(url, data={'task': '9', 'status': 'skipped'}, format='json')
-        assert resp.status_code == 204
+    def test_update_onboarding_task(self):
+        data = {"task": "setup_issue_tracker", "status": "skipped"}
+        self.get_success_response(self.organization.slug, status_code=204, **data)
 
         oot = OrganizationOnboardingTask.objects.get(
-            organization=organization,
+            organization=self.organization,
             task=OnboardingTask.ISSUE_TRACKER,
-            status=OnboardingTaskStatus.SKIPPED
+            status=OnboardingTaskStatus.SKIPPED,
         )
 
         assert oot

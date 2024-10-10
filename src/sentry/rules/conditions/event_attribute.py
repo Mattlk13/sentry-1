@@ -1,79 +1,53 @@
-from __future__ import absolute_import
+from __future__ import annotations
 
-import json
-import six
+from collections.abc import Sequence
+from typing import Any
 
-from collections import OrderedDict
 from django import forms
 
+from sentry.eventstore.models import GroupEvent
+from sentry.rules import MATCH_CHOICES, EventState, MatchType, match_values
 from sentry.rules.conditions.base import EventCondition
+from sentry.rules.history.preview_strategy import DATASET_TO_COLUMN_NAME, get_dataset_columns
+from sentry.snuba.dataset import Dataset
+from sentry.snuba.events import Columns
+from sentry.types.condition_activity import ConditionActivity
 
-
-class MatchType(object):
-    EQUAL = 'eq'
-    NOT_EQUAL = 'ne'
-    STARTS_WITH = 'sw'
-    ENDS_WITH = 'ew'
-    CONTAINS = 'co'
-    NOT_CONTAINS = 'nc'
-    IS_SET = 'is'
-    NOT_SET = 'ns'
-
-
-MATCH_CHOICES = OrderedDict(
-    [
-        (MatchType.EQUAL, 'equals'),
-        (MatchType.NOT_EQUAL, 'does not equal'),
-        (MatchType.STARTS_WITH, 'starts with'),
-        (MatchType.ENDS_WITH, 'ends with'),
-        (MatchType.CONTAINS, 'contains'),
-        (MatchType.NOT_CONTAINS, 'does not contain'),
-        (MatchType.IS_SET, 'is set'),
-        (MatchType.NOT_SET, 'is not set'),
-    ]
-)
-
-ATTR_CHOICES = [
-    'message',
-    'platform',
-    'environment',
-    'type',
-    'exception.type',
-    'exception.value',
-    'user.id',
-    'user.email',
-    'user.username',
-    'user.ip_address',
-    'http.method',
-    'http.url',
-    'stacktrace.code',
-    'stacktrace.module',
-    'stacktrace.filename',
-]
-
-
-class FixedTypeaheadInput(forms.TextInput):
-    def __init__(self, choices, *args, **kwargs):
-        super(FixedTypeaheadInput, self).__init__(*args, **kwargs)
-        self.attrs['data-choices'] = json.dumps(choices)
-        self.attrs['class'] = self.attrs.get('class', '') + ' typeahead'
+# Maps attributes to snuba columns
+ATTR_CHOICES = {
+    "message": Columns.MESSAGE,
+    "platform": Columns.PLATFORM,
+    "environment": Columns.MESSAGE,
+    "type": Columns.TYPE,
+    "error.handled": Columns.ERROR_HANDLED,
+    "error.unhandled": Columns.ERROR_HANDLED,
+    "error.main_thread": Columns.ERROR_MAIN_THREAD,
+    "exception.type": Columns.ERROR_TYPE,
+    "exception.value": Columns.ERROR_VALUE,
+    "user.id": Columns.USER_ID,
+    "user.email": Columns.USER_EMAIL,
+    "user.username": Columns.USER_USERNAME,
+    "user.ip_address": Columns.USER_IP_ADDRESS,
+    "http.method": Columns.HTTP_METHOD,
+    "http.url": Columns.HTTP_URL,
+    "http.status_code": Columns.HTTP_STATUS_CODE,
+    "sdk.name": Columns.SDK_NAME,
+    "stacktrace.code": None,
+    "stacktrace.module": Columns.STACK_MODULE,
+    "stacktrace.filename": Columns.STACK_FILENAME,
+    "stacktrace.abs_path": Columns.STACK_ABS_PATH,
+    "stacktrace.package": Columns.STACK_PACKAGE,
+    "unreal.crashtype": Columns.UNREAL_CRASH_TYPE,
+    "app.in_foreground": Columns.APP_IN_FOREGROUND,
+    "os.distribution.name": Columns.OS_DISTRIBUTION_NAME,
+    "os.distribution.version": Columns.OS_DISTRIBUTION_VERSION,
+}
 
 
 class EventAttributeForm(forms.Form):
-    attribute = forms.CharField(
-        widget=FixedTypeaheadInput(
-            choices=[{
-                'id': a,
-                'text': a
-            } for a in ATTR_CHOICES],
-        )
-    )
-    match = forms.ChoiceField(
-        MATCH_CHOICES.items()
-    )
-    value = forms.CharField(
-        widget=forms.TextInput(), required=False
-    )
+    attribute = forms.ChoiceField(choices=[(a, a) for a in ATTR_CHOICES.keys()])
+    match = forms.ChoiceField(choices=list(MATCH_CHOICES.items()))
+    value = forms.CharField(widget=forms.TextInput(), required=False)
 
 
 class EventAttributeCondition(EventCondition):
@@ -87,56 +61,49 @@ class EventAttributeCondition(EventCondition):
     - exception.{type,value}
     - user.{id,ip_address,email,FIELD}
     - http.{method,url}
-    - stacktrace.{code,module,filename}
+    - stacktrace.{code,module,filename,abs_path,package}
     - extra.{FIELD}
     """
-    # TODO(dcramer): add support for stacktrace.vars.[name]
 
+    id = "sentry.rules.conditions.event_attribute.EventAttributeCondition"
     form_cls = EventAttributeForm
-    label = u'An event\'s {attribute} value {match} {value}'
+    label = "The event's {attribute} value {match} {value}"
 
     form_fields = {
-        'attribute': {
-            'type': 'choice',
-            'placeholder': 'i.e. exception.type',
-            'choices': [[a, a] for a in ATTR_CHOICES]
+        "attribute": {
+            "type": "choice",
+            "placeholder": "i.e. exception.type",
+            "choices": [[a, a] for a in ATTR_CHOICES.keys()],
         },
-        'match': {
-            'type': 'choice',
-            'choices': MATCH_CHOICES.items()
-        },
-        'value': {
-            'type': 'string',
-            'placeholder': 'value'
-        }
+        "match": {"type": "choice", "choices": list(MATCH_CHOICES.items())},
+        "value": {"type": "string", "placeholder": "value"},
     }
 
-    def _get_attribute_values(self, event, attr):
+    def _get_attribute_values(self, event: GroupEvent, attr: str) -> Sequence[object | None]:
         # TODO(dcramer): we should validate attributes (when we can) before
-        path = attr.split('.')
+        path = attr.split(".")
 
-        if path[0] == 'platform':
+        if path[0] == "platform":
             if len(path) != 1:
                 return []
             return [event.platform]
 
-        if path[0] == 'message':
+        if path[0] == "message":
             if len(path) != 1:
                 return []
-            return [event.real_message]
+            return [event.message, event.search_message]
+        elif path[0] == "environment":
+            return [event.get_tag("environment")]
 
-        elif path[0] == 'environment':
-            return [event.get_tag('environment')]
-
-        elif path[0] == 'type':
-            return [event.data['type']]
+        elif path[0] == "type":
+            return [event.data["type"]]
 
         elif len(path) == 1:
             return []
 
-        elif path[0] == 'extra':
+        elif path[0] == "extra":
             path.pop(0)
-            value = event.data['extra']
+            value = event.data["extra"]
             while path:
                 bit = path.pop(0)
                 value = value.get(bit)
@@ -147,44 +114,68 @@ class EventAttributeCondition(EventCondition):
                 return value
             return [value]
 
-        elif len(path) != 2:
-            return []
+        elif len(path) < 2:
+            return []  # all attribute paths below have at least 2 elements
 
-        elif path[0] == 'exception':
-            if path[1] not in ('type', 'value'):
+        elif path[0] == "exception":
+            if path[1] not in ("type", "value"):
                 return []
 
             return [
-                getattr(e, path[1]) for e in event.interfaces['exception'].values
+                getattr(e, path[1]) for e in event.interfaces["exception"].values if e is not None
             ]
 
-        elif path[0] == 'user':
-            if path[1] in ('id', 'ip_address', 'email', 'username'):
-                return [getattr(event.interfaces['user'], path[1])]
-            return [getattr(event.interfaces['user'].data, path[1])]
+        elif path[0] == "error":
+            # TODO: add support for error.main_thread
 
-        elif path[0] == 'http':
-            if path[1] not in ('url', 'method'):
+            if path[1] not in ("handled", "unhandled"):
                 return []
 
-            return [getattr(event.interfaces['request'], path[1])]
+            # Flip "handled" to "unhandled"
+            negate = path[1] == "unhandled"
 
-        elif path[0] == 'stacktrace':
-            stacks = event.interfaces.get('stacktrace')
-            if stacks:
-                stacks = [stacks]
+            return [
+                e.mechanism.handled != negate
+                for e in event.interfaces["exception"].values
+                if e.mechanism is not None and getattr(e.mechanism, "handled") is not None
+            ]
+
+        elif path[0] == "user":
+            if path[1] in ("id", "ip_address", "email", "username"):
+                return [getattr(event.interfaces["user"], path[1])]
+            return [getattr(event.interfaces["user"].data, path[1])]
+
+        elif path[0] == "http":
+            if path[1] in ("url", "method"):
+                return [getattr(event.interfaces["request"], path[1])]
+            elif path[1] in ("status_code"):
+                contexts = event.data["contexts"]
+                response = contexts.get("response")
+                if response is None:
+                    response = {}
+                return [response.get(path[1])]
+
+            return []
+
+        elif path[0] == "sdk":
+            if path[1] != "name":
+                return []
+            return [event.data["sdk"].get(path[1])]
+
+        elif path[0] == "stacktrace":
+            stacktrace = event.interfaces.get("stacktrace")
+            if stacktrace:
+                stacks = [stacktrace]
             else:
                 stacks = [
-                    e.stacktrace for e in event.interfaces['exception'].values
-                    if e.stacktrace
+                    e.stacktrace for e in event.interfaces["exception"].values if e.stacktrace
                 ]
-
             result = []
             for st in stacks:
                 for frame in st.frames:
-                    if path[1] in ('filename', 'module'):
+                    if path[1] in ("filename", "module", "abs_path", "package"):
                         result.append(getattr(frame, path[1]))
-                    elif path[1] == 'code':
+                    elif path[1] == "code":
                         if frame.pre_context:
                             result.extend(frame.pre_context)
                         if frame.context_line:
@@ -192,76 +183,127 @@ class EventAttributeCondition(EventCondition):
                         if frame.post_context:
                             result.extend(frame.post_context)
             return result
+
+        elif path[0] == "device":
+            if path[1] in (
+                "screen_density",
+                "screen_dpi",
+                "screen_height_pixels",
+                "screen_width_pixels",
+            ):
+                contexts = event.data["contexts"]
+                device = contexts.get("device")
+                if device is None:
+                    device = []
+                return [device.get(path[1])]
+
+        elif path[0] == "unreal":
+            if path[1] == "crash_type":
+                contexts = event.data["contexts"]
+                unreal = contexts.get("unreal")
+                if unreal is None:
+                    unreal = {}
+                return [unreal.get(path[1])]
+
+        elif path[0] == "app":
+            if path[1] in ("in_foreground"):
+                contexts = event.data["contexts"]
+                response = contexts.get("app")
+                if response is None:
+                    response = {}
+                return [response.get(path[1])]
+
+        elif len(path) < 3:
+            return []  # all attribute paths below have at least 3 elements
+
+        elif path[0] == "os":
+            if path[1] in ("distribution"):
+                if path[2] in ("name", "version"):
+                    contexts = event.data["contexts"]
+                    os_context = contexts.get("os")
+                    if os_context is None:
+                        os_context = {}
+
+                    distribution = os_context.get(path[1])
+                    if distribution is None:
+                        distribution = {}
+
+                    return [distribution.get(path[2])]
+                return []
+            return []
+
         return []
 
-    def render_label(self):
+    def render_label(self) -> str:
         data = {
-            'attribute': self.data['attribute'],
-            'value': self.data['value'],
-            'match': MATCH_CHOICES[self.data['match']],
+            "attribute": self.data["attribute"],
+            "value": self.data["value"],
+            "match": MATCH_CHOICES[self.data["match"]],
         }
         return self.label.format(**data)
 
-    def passes(self, event, state, **kwargs):
-        attr = self.get_option('attribute')
-        match = self.get_option('match')
-        value = self.get_option('value')
+    def _passes(self, attribute_values: Sequence[object | None]) -> bool:
+        option_match = self.get_option("match")
+        option_value = self.get_option("value")
 
-        if not (attr and match and value):
+        if not (
+            (option_match and option_value)
+            or (option_match in (MatchType.IS_SET, MatchType.NOT_SET))
+        ):
             return False
 
-        value = value.lower()
-        attr = attr.lower()
+        option_value = option_value.lower()
 
+        attr_values = [str(v).lower() for v in attribute_values if v is not None]
+
+        # NOTE: IS_SET condition differs btw tagged_event and event_attribute so not handled by match_values
+        if option_match == MatchType.IS_SET:
+            return bool(attr_values)
+
+        elif option_match == MatchType.NOT_SET:
+            return not attr_values
+
+        return match_values(
+            group_values=attr_values, match_value=option_value, match_type=option_match
+        )
+
+    def passes(self, event: GroupEvent, state: EventState, **kwargs: Any) -> bool:
+        attr = self.get_option("attribute", "")
         try:
-            attribute_values = self._get_attribute_values(event, attr)
+            attribute_values = self._get_attribute_values(event, attr.lower())
         except KeyError:
             attribute_values = []
 
-        attribute_values = [
-            six.text_type(v).lower()
-            for v in attribute_values
-            if v is not None
-        ]
+        return self._passes(attribute_values)
 
-        if match == MatchType.EQUAL:
-            for a_value in attribute_values:
-                if a_value == value:
-                    return True
+    def passes_activity(
+        self, condition_activity: ConditionActivity, event_map: dict[str, Any]
+    ) -> bool:
+        try:
+            attr = self.get_option("attribute").lower()
+            dataset = condition_activity.data["dataset"]
+            column = ATTR_CHOICES[attr]
+            if column is None:
+                raise NotImplementedError
+
+            column = getattr(column.value, DATASET_TO_COLUMN_NAME[dataset])
+            attribute_values = event_map[condition_activity.data["event_id"]][column]
+
+            if isinstance(attribute_values, str):
+                attribute_values = [attribute_values]
+
+            # flip values, since the queried column is "error.handled"
+            if attr == "error.unhandled":
+                attribute_values = [not value for value in attribute_values]
+
+            return self._passes(attribute_values)
+        except (TypeError, KeyError):
             return False
 
-        elif match == MatchType.NOT_EQUAL:
-            for a_value in attribute_values:
-                if a_value == value:
-                    return False
-            return True
-
-        elif match == MatchType.STARTS_WITH:
-            for a_value in attribute_values:
-                if a_value.startswith(value):
-                    return True
-            return False
-
-        elif match == MatchType.ENDS_WITH:
-            for a_value in attribute_values:
-                if a_value.endswith(value):
-                    return True
-            return False
-
-        elif match == MatchType.CONTAINS:
-            for a_value in attribute_values:
-                if value in a_value:
-                    return True
-            return False
-
-        elif match == MatchType.NOT_CONTAINS:
-            for a_value in attribute_values:
-                if value in a_value:
-                    return False
-            return True
-
-        elif match == MatchType.IS_SET:
-            return bool(attribute_values)
-
-        elif match == MatchType.NOT_SET:
-            return not attribute_values
+    def get_event_columns(self) -> dict[Dataset, Sequence[str]]:
+        attr = self.get_option("attribute")
+        column = ATTR_CHOICES[attr]
+        if column is None:
+            raise NotImplementedError
+        columns: dict[Dataset, Sequence[str]] = get_dataset_columns([column])
+        return columns

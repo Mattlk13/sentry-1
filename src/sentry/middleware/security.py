@@ -1,17 +1,16 @@
-from __future__ import absolute_import
+from django.utils.deprecation import MiddlewareMixin
+from rest_framework.request import Request
+from rest_framework.response import Response
 
 
-class SecurityHeadersMiddleware(object):
+class SecurityHeadersMiddleware(MiddlewareMixin):
     """
-    Ensure that we have proper security headers set
+    Ensure that we have proper security headers set.
     """
 
-    def process_response(self, request, response):
-        # NOTE: there is no `response.setdefault()`
-        if 'X-Frame-Options' not in response:
-            response['X-Frame-Options'] = 'deny'
-        if 'X-Content-Type-Options' not in response:
-            response['X-Content-Type-Options'] = 'nosniff'
-        if 'X-XSS-Protection' not in response:
-            response['X-XSS-Protection'] = '1; mode=block'
+    def process_response(self, request: Request, response: Response) -> Response:
+        if not request.path.startswith("/extensions/jira/"):
+            response.setdefault("X-Frame-Options", "deny")
+        response.setdefault("X-Content-Type-Options", "nosniff")
+        response.setdefault("X-XSS-Protection", "1; mode=block")
         return response

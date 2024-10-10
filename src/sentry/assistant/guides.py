@@ -1,103 +1,58 @@
-from __future__ import absolute_import
+from django.conf import settings
 
-from django.utils.translation import ugettext_lazy as _
+# Guide definitions
+#
+# The id of each guide should be unique and immutable, as it is stored in the
+# AssistantActivity model to record when the guide was seen / dismissed.
+#
+# Guide UI elements are configured on the frontend in `getGuideContent.tsx`.
 
-
-# Guide Schema
-# id (text, required): unique id
-# required_targets (list): An empty list will cause the guide to be shown regardless
-#                          of page/targets presence.
-# steps (list): List of steps
-
-# Step Schema
-# title (text, required): Title text. Tone should be active.
-# message (text, optional): Message text. Should help illustrate how to do a task, not
-#                           just literally what the button does.
-# target (text, optional): step is tied to an anchor target. If the anchor doesn't exist,
-#                          the step will not be shown. if the anchor exists but is of type
-#                         "invisible", it will not be pinged but will be scrolled to.
-#                          otherwise the anchor will be pinged and scrolled to. If you'd like
-#                          your step to show always or have a step is not tied to a specific
-#                          element but you'd still like it to be shown, set this as None.
 
 GUIDES = {
-    'issue': {
-        'id': 1,
-        'required_targets': ['issue_title', 'exception'],
-        'steps': [
-            {
-                'title': _('Issue Details'),
-                'message': _('The issue page contains all the details about an issue. Let\'s get started.'),
-                'target': 'issue_title',
-            },
-            {
-                'title': _('Stacktrace'),
-                'message': _(
-                    'See the sequence of function calls that led to the error, and '
-                    'global/local variables for each stack frame.'),
-                'target': 'exception',
-            },
-            {
-                'title': _('Breadcrumbs'),
-                'message': _(
-                    'Breadcrumbs are a trail of events that happened prior to the error. They\'re '
-                    'similar to traditional logs but can record more rich structured data. '
-                    'When Sentry is used with web frameworks, breadcrumbs are automatically '
-                    'captured for events like database calls and network requests.'),
-                'target': 'breadcrumbs',
-            },
-            {
-                'title': _('Tags'),
-                'message': _(
-                    'Attach arbitrary key-value pairs to each event which you can search and filter on. '
-                    'View a heatmap of all tags for an issue on the right panel. '),
-                'target': 'tags',
-            },
-            {
-                'title': _('Resolve'),
-                'message': _(
-                    'Resolve an issue to remove it from your issue list. '
-                    'Sentry can also <a href="/settings/account/notifications/" target="_blank"> '
-                    'alert you</a> when a new issue occurs or a resolved issue re-occurs.'),
-                'target': 'resolve',
-            },
-            {
-                'title': _('Delete and Ignore'),
-                'message': _(
-                    'Delete an issue to remove it from your issue list until it happens again. '
-                    'Ignore an issue to remove it permanently or until certain conditions are met.'),
-                'target': 'ignore_delete_discard',
-            },
-            {
-                'title': _('Issue Number'),
-                'message': _(
-                    'Include this unique identifier in your commit message to have Sentry automatically '
-                    'resolve the issue when your code is deployed. '
-                    '<a href="https://docs.sentry.io/learn/releases/" target="_blank">Learn more</a>.'),
-                'target': 'issue_number',
-            },
-            {
-                'title': _('Ownership Rules'),
-                'message': _(
-                    'Define users or teams responsible for specific file paths or URLs so '
-                    'that alerts can be routed to the right person. '
-                    '<a href="https://docs.sentry.io/learn/issue-owners/" target="_blank">Learn more</a>.'),
-                'target': 'owners',
-            },
-        ],
-    },
-    'issue_stream': {
-        'id': 3,
-        'required_targets': ['issue_stream'],
-        'steps': [
-            {
-                'title': _('Issues'),
-                'message': _(
-                    'Sentry automatically groups similar events together into an issue. Similarity '
-                    'is determined by stacktrace and other factors. '
-                    '<a href="https://docs.sentry.io/data-management/rollups/" target="_blank">Learn more</a>. '),
-                'target': 'issue_stream',
-            },
-        ],
-    },
+    "issue": 1,
+    "issue_stream": 3,
+    "alerts_write_member": 10,
+    "alerts_write_owner": 11,
+    "trace_view": 16,
+    "span_op_breakdowns_and_tag_explorer": 17,
+    "team_key_transactions": 18,
+    "project_transaction_threshold": 19,
+    "project_transaction_threshold_override": 20,
+    "semver": 22,
+    "release_stages": 23,
+    "new_page_filters": 24,
+    "new_page_filters_pin": 25,
+    "releases_widget": 26,
+    "activate_sampling_rule": 27,
+    "create_conditional_rule": 28,
+    "explain_archive_button_issue_details": 29,
+    "explain_archive_tab_issue_stream": 30,
+    "explain_new_default_event_issue_detail": 31,
+    "new_project_filter": 32,
+    "explain_archive_button_issue_stream": 33,
+    "ddm_view": 34,
+    "metrics_onboarding": 37,
 }
+
+# demo mode has different guides
+if settings.DEMO_MODE:
+    # TODO: remove old guides
+    GUIDES = {
+        "sidebar": 20,
+        "issue_stream_v2": 21,
+        "issue_v2": 22,
+        "releases": 23,
+        "release_details": 24,
+        "discover_landing": 25,
+        "discover_event_view": 26,
+        "transaction_details": 27,
+        "sidebar_v2": 28,
+        "issues_v3": 29,
+        "releases_v2": 30,
+        "react-native-release": 31,
+        "release-details_v2": 32,
+        "performance": 33,
+        "transaction_summary": 34,
+        "transaction_details_v2": 35,
+        "issue_stream_v3": 36,
+    }

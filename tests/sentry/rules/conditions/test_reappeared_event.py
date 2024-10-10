@@ -1,7 +1,8 @@
-from __future__ import absolute_import
-
-from sentry.testutils.cases import RuleTestCase
 from sentry.rules.conditions.reappeared_event import ReappearedEventCondition
+from sentry.testutils.cases import RuleTestCase
+from sentry.testutils.skips import requires_snuba
+
+pytestmark = [requires_snuba]
 
 
 class ReappearedEventConditionTest(RuleTestCase):

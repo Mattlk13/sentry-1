@@ -1,8 +1,6 @@
-from __future__ import absolute_import
-
 from rest_framework import serializers
+from rest_framework.serializers import ListField
 
-from .list import ListField
 from sentry.api.fields.actor import ActorField
 from sentry.api.serializers.rest_framework.mentions import MentionsMixin
 

@@ -1,76 +1,19 @@
-from __future__ import absolute_import
+def is_self_hosted() -> bool:
+    # Backcompat for rename to support old consumers, particularly single-tenant.
+    from django.conf import settings
 
-import inspect
-import six
-import sys
-
-from sentry.utils.imports import import_string
-
-PACKAGES = {
-    'django.db.backends.postgresql_psycopg2': 'psycopg2.extensions',
-    'sentry.db.postgres': 'psycopg2.extensions',
-    'django.core.cache.backends.memcached.MemcachedCache': 'memcache',
-    'django.core.cache.backends.memcached.PyLibMCCache': 'pylibmc'
-}
+    return settings.SENTRY_SELF_HOSTED
 
 
-def reraise_as(new_exception_or_type):
-    """
-    Obtained from https://github.com/dcramer/reraise/blob/master/src/reraise.py
-    >>> try:
-    >>>     do_something_crazy()
-    >>> except Exception:
-    >>>     reraise_as(UnhandledException)
-    """
-    __traceback_hide__ = True  # NOQA
+def should_show_beacon_consent_prompt() -> bool:
+    from django.conf import settings
 
-    e_type, e_value, e_traceback = sys.exc_info()
+    from sentry import options
 
-    if inspect.isclass(new_exception_or_type):
-        new_type = new_exception_or_type
-        new_exception = new_exception_or_type()
-    else:
-        new_type = type(new_exception_or_type)
-        new_exception = new_exception_or_type
-
-    new_exception.__cause__ = e_value
-
-    try:
-        six.reraise(new_type, new_exception, e_traceback)
-    finally:
-        del e_traceback
+    return settings.SENTRY_SELF_HOSTED and not options.isset("beacon.record_cpu_ram_usage")
 
 
-def validate_settings(settings):
-    for key, engine_key, engine_type in \
-            [('DATABASES', 'ENGINE', 'database engine'), ('CACHES', 'BACKEND', 'caching backend')]:
+def is_self_hosted_errors_only() -> bool:
+    from django.conf import settings
 
-        value = getattr(settings, key, {})
-        for alias in value:
-            engine = value[alias][engine_key]
-            if engine not in PACKAGES:
-                continue
-            validate_dependency(settings, engine_type, engine, PACKAGES[engine])
-
-
-def validate_dependency(settings, dependency_type, dependency, package):
-    try:
-        import_string(package)
-    except ImportError:
-        msg = ConfigurationError.get_error_message(
-            "%s %s" % (dependency_type, dependency), package)
-        reraise_as(ConfigurationError(msg))
-
-
-class ConfigurationError(ValueError):
-    """
-    This error is thrown whenever a sentry configuration is wrong, or requires a third-party library
-    that's not installed properly or can't be found.
-    """
-
-    @classmethod
-    def get_error_message(cls, dependency, package):
-        return """Python could not find %(package)s in your current environment (required by %(dependency)s). If you have it installed, maybe you are using the wrong python binary to run sentry?""" % {
-            "dependency": dependency,
-            "package": package
-        }
+    return settings.SENTRY_SELF_HOSTED_ERRORS_ONLY and settings.SENTRY_SELF_HOSTED

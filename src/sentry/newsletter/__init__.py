@@ -1,10 +1,8 @@
-from __future__ import absolute_import
-
 from django.conf import settings
 
 from sentry.utils.services import LazyServiceWrapper
 
-from .base import Newsletter  # NOQA
+from .base import Newsletter
 
 backend = LazyServiceWrapper(
     Newsletter, settings.SENTRY_NEWSLETTER, settings.SENTRY_NEWSLETTER_OPTIONS

@@ -1,24 +1,25 @@
-from __future__ import absolute_import
+from django.http import HttpResponse, StreamingHttpResponse
+from django.http.response import HttpResponseBase
+from rest_framework.request import Request
 
-import six
-
-try:
-    from django.http import (
-        HttpResponse,
-        CompatibleStreamingHttpResponse as StreamingHttpResponse)
-except ImportError:
-    from django.http import HttpResponse, StreamingHttpResponse
-
+from sentry import eventstore
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import region_silo_endpoint
 from sentry.api.bases.project import ProjectEndpoint
 from sentry.api.exceptions import ResourceDoesNotExist
-from sentry.models import Event, SnubaEvent
 from sentry.lang.native.applecrashreport import AppleCrashReport
 from sentry.utils.safe import get_path
 
 
+@region_silo_endpoint
 class EventAppleCrashReportEndpoint(ProjectEndpoint):
+    owner = ApiOwner.OWNERS_INGEST
+    publish_status = {
+        "GET": ApiPublishStatus.PRIVATE,
+    }
 
-    def get(self, request, project, event_id):
+    def get(self, request: Request, project, event_id) -> HttpResponseBase:
         """
         Retrieve an Apple Crash Report from an event
         `````````````````````````````````````````````
@@ -26,42 +27,36 @@ class EventAppleCrashReportEndpoint(ProjectEndpoint):
         This endpoint returns the an apple crash report for a specific event.
         This works only if the event.platform == cocoa
         """
-        event = SnubaEvent.objects.from_event_id(event_id, project_id=project.id)
+        event = eventstore.backend.get_event_by_id(project.id, event_id)
         if event is None:
             raise ResourceDoesNotExist
 
-        Event.objects.bind_nodes([event], 'data')
-
-        if event.platform not in ('cocoa', 'native'):
+        if event.platform not in ("cocoa", "native"):
             return HttpResponse(
-                {
-                    'message': 'Only cocoa events can return an apple crash report',
-                }, status=403
+                {"message": "Only cocoa events can return an apple crash report"}, status=403
             )
 
-        symbolicated = (request.GET.get('minified') not in ('1', 'true'))
+        symbolicated = request.GET.get("minified") not in ("1", "true")
 
-        apple_crash_report_string = six.text_type(
+        apple_crash_report_string = str(
             AppleCrashReport(
-                threads=get_path(event.data, 'threads', 'values', filter=True),
-                context=event.data.get('contexts'),
-                debug_images=get_path(event.data, 'debug_meta', 'images', filter=True),
-                exceptions=get_path(event.data, 'exception', 'values', filter=True),
+                threads=get_path(event.data, "threads", "values", filter=True),
+                context=event.data.get("contexts"),
+                debug_images=get_path(event.data, "debug_meta", "images", filter=True),
+                exceptions=get_path(event.data, "exception", "values", filter=True),
                 symbolicated=symbolicated,
             )
         )
 
-        response = HttpResponse(apple_crash_report_string,
-                                content_type='text/plain')
-
-        if request.GET.get('download') is not None:
-            filename = u"{}{}.crash".format(
-                event.event_id, symbolicated and '-symbolicated' or '')
-            response = StreamingHttpResponse(
+        if request.GET.get("download") is not None:
+            filename = "{}{}.crash".format(event.event_id, symbolicated and "-symbolicated" or "")
+            return StreamingHttpResponse(
                 apple_crash_report_string,
-                content_type='text/plain',
+                content_type="text/plain",
+                headers={
+                    "Content-Length": len(apple_crash_report_string),
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                },
             )
-            response['Content-Length'] = len(apple_crash_report_string)
-            response['Content-Disposition'] = 'attachment; filename="%s"' % filename
-
-        return response
+        else:
+            return HttpResponse(apple_crash_report_string, content_type="text/plain")

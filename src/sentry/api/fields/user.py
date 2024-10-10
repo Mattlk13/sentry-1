@@ -1,28 +1,28 @@
-from __future__ import absolute_import, print_function
+from __future__ import annotations
 
-import six
+from typing import Any
 
 from rest_framework import serializers
 
-from sentry.models import User
-from sentry.utils.auth import find_users
+from sentry.users.models.user import User
+from sentry.users.services.user import RpcUser
+from sentry.users.services.user.service import user_service
 
 
 class UserField(serializers.Field):
-    def to_representation(self, value):
+    def to_representation(self, value: RpcUser) -> str:
         return value.username
 
-    def to_internal_value(self, data):
+    def to_internal_value(self, data: Any) -> RpcUser | User | None:
         if not data:
             return None
 
-        if isinstance(data, six.integer_types) or data.isdigit():
-            try:
-                return User.objects.get(id=data)
-            except User.DoesNotExist:
-                pass
+        if isinstance(data, int) or data.isdigit():
+            user = user_service.get_user(user_id=data)
+            if user is not None:
+                return user
 
         try:
-            return find_users(data)[0]
+            return user_service.get_by_username(username=data)[0]
         except IndexError:
-            raise serializers.ValidationError('Unable to find user')
+            raise serializers.ValidationError("Unable to find user")

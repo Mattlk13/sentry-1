@@ -1,14 +1,18 @@
-from __future__ import absolute_import
+from django.utils.functional import cached_property
 
-from sentry.mediators import Mediator, Param
-from sentry.models import Repository
-from sentry.plugins import plugins
-from sentry.utils.cache import memoize
+from sentry.integrations.services.integration.model import RpcIntegration
+from sentry.integrations.services.repository import repository_service
+from sentry.integrations.services.repository.model import RpcRepository
+from sentry.mediators.mediator import Mediator
+from sentry.mediators.param import Param
+from sentry.organizations.services.organization.model import RpcOrganization
+from sentry.plugins.base import plugins
 
 
 class Migrator(Mediator):
-    integration = Param('sentry.models.integration.Integration')
-    organization = Param('sentry.models.organization.Organization')
+    integration = Param(RpcIntegration)
+    organization = Param(RpcOrganization)
+    using = None
 
     def call(self):
         for project in self.projects:
@@ -23,45 +27,35 @@ class Migrator(Mediator):
                     self.disable_for_all_projects(plugin)
 
     def all_repos_migrated(self, provider):
-        provider = 'visualstudio' if provider == 'vsts' else provider
-
-        return all(
-            r.integration_id is not None
-            for r in self.repos_for_provider(provider)
-        )
+        return all(r.integration_id is not None for r in self.repos_for_provider(provider))
 
     def disable_for_all_projects(self, plugin):
         for project in self.projects:
             try:
-                self.log(at='disable', project=project.slug, plugin=plugin.slug)
+                self.log(at="disable", project=project.slug, plugin=plugin.slug)
                 plugin.disable(project=project)
             except NotImplementedError:
                 pass
 
     def repos_for_provider(self, provider):
-        return filter(lambda r: r.provider == provider, self.repositories)
+        return [r for r in self.repositories if r.provider == provider]
 
     @property
-    def repositories(self):
-        return Repository.objects.filter(
-            organization_id=self.organization.id,
-        )
+    def repositories(self) -> list[RpcRepository]:
+        return repository_service.get_repositories(organization_id=self.organization.id)
 
-    @memoize
+    @cached_property
     def projects(self):
-        return list(self.organization.project_set.all())
+        return list(self.organization.projects)
 
     @property
     def plugins(self):
-        return [
-            plugins.configurable_for_project(project)
-            for project in self.projects
-        ]
+        return [plugins.configurable_for_project(project) for project in self.projects]
 
     @property
     def _logging_context(self):
         return {
-            'org': self.organization.slug,
-            'integration_id': self.integration.id,
-            'integration_provider': self.integration.provider,
+            "org": self.organization.slug,
+            "integration_id": self.integration.id,
+            "integration_provider": self.integration.provider,
         }

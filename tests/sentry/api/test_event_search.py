@@ -1,1206 +1,741 @@
-from __future__ import absolute_import
-
 import datetime
-import pytest
-import six
+import os
 from datetime import timedelta
+from unittest.mock import patch
 
+import pytest
+from django.test import SimpleTestCase
 from django.utils import timezone
-from freezegun import freeze_time
 
 from sentry.api.event_search import (
-    convert_endpoint_params, event_search_grammar, get_snuba_query_args,
-    parse_search_query, InvalidSearchQuery, SearchBoolean, SearchFilter, SearchKey,
-    SearchValue, SearchVisitor,
+    AggregateFilter,
+    AggregateKey,
+    SearchConfig,
+    SearchFilter,
+    SearchKey,
+    SearchValue,
+    parse_search_query,
 )
-from sentry.testutils import TestCase
+from sentry.constants import MODULE_ROOT
+from sentry.exceptions import InvalidSearchQuery
+from sentry.search.utils import parse_datetime_string, parse_duration, parse_numeric_value
+from sentry.testutils.helpers.datetime import freeze_time
+from sentry.utils import json
+
+fixture_path = "fixtures/search-syntax"
+abs_fixtures_path = os.path.join(MODULE_ROOT, os.pardir, os.pardir, fixture_path)
 
 
-class ParseSearchQueryTest(TestCase):
-    def test_simple(self):
-        # test with raw search query at the end
-        assert parse_search_query('user.email:foo@example.com release:1.2.1 hello') == [
-            SearchFilter(
-                key=SearchKey(name='user.email'),
-                operator="=",
-                value=SearchValue(raw_value='foo@example.com'),
-            ),
-            SearchFilter(
-                key=SearchKey(name='release'),
-                operator="=",
-                value=SearchValue(raw_value='1.2.1'),
-            ),
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='hello'),
+def register_fixture_tests(cls, skipped):
+    """
+    Registers test fixtures onto a class with a run_test_case method
+    """
+
+    def assign_test_case(name, tests):
+        if name in skipped:
+            return
+
+        def runner(self):
+            for case in tests:
+                self.run_test_case(name, case)
+
+        setattr(cls, f"test_{name}", runner)
+
+    for file in (f for f in os.listdir(abs_fixtures_path)):
+        name = file[: len(".json") * -1]
+
+        with open(os.path.join(abs_fixtures_path, file)) as fp:
+            tests = json.load(fp)
+        assign_test_case(name, tests)
+
+
+def result_transformer(result):
+    """
+    This is used to translate the expected token results from the format used
+    in the JSON test data (which is more close to the lossless frontend AST) to
+    the backend version, which is much more lossy (meaning spaces, and other
+    un-important syntax is removed).
+
+    This includes various transformations (which are tested elsewhere) that are
+    done in the SearchVisitor.
+    """
+
+    def node_visitor(token):
+        if token["type"] == "spaces":
+            return None
+
+        if token["type"] == "filter":
+            # Filters with an invalid reason raises to signal to the test
+            # runner that we should expect this exception
+            if token.get("invalid"):
+                raise InvalidSearchQuery(token["invalid"]["reason"])
+
+            # Transform the operator to match for list values
+            if token["value"]["type"] in ["valueTextList", "valueNumberList"]:
+                operator = "NOT IN" if token["negated"] else "IN"
+            else:
+                # Negate the operator if the filter is negated to match
+                operator = token["operator"] or "="
+                operator = f"!{operator}" if token["negated"] else operator
+
+            key = node_visitor(token["key"])
+            value = node_visitor(token["value"])
+
+            if token["filter"] == "boolean" and token["negated"]:
+                operator = "="
+                value = SearchValue(raw_value=1 if value.raw_value == 0 else 0)
+
+            return SearchFilter(key, operator, value)
+
+        if token["type"] == "keySimple":
+            return SearchKey(name=token["value"])
+
+        if token["type"] == "keyExplicitTag":
+            return SearchKey(name=f"tags[{token['key']['value']}]")
+
+        if token["type"] == "keyAggregate":
+            name = node_visitor(token["name"]).name
+            # Consistent join aggregate function parameters
+            args = ", ".join(arg["value"]["value"] for arg in token["args"]["args"])
+            return AggregateKey(name=f"{name}({args})")
+
+        if token["type"] == "valueText":
+            # Noramlize values by removing the escaped quotes
+            value = token["value"].replace('\\"', '"')
+            return SearchValue(raw_value=value)
+
+        if token["type"] == "valueNumber":
+            return SearchValue(raw_value=parse_numeric_value(token["value"], token["unit"]))
+
+        if token["type"] == "valueTextList":
+            return SearchValue(raw_value=[item["value"]["value"] for item in token["items"]])
+
+        if token["type"] == "valueNumberList":
+            return SearchValue(
+                raw_value=[
+                    parse_numeric_value(item["value"]["value"], item["value"]["unit"])
+                    for item in token["items"]
+                ]
             )
-        ]
 
-        assert parse_search_query('hello user.email:foo@example.com release:1.2.1') == [
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='hello'),
-            ),
-            SearchFilter(
-                key=SearchKey(name='user.email'),
+        if token["type"] == "valueIso8601Date":
+            return SearchValue(raw_value=parse_datetime_string(token["value"]))
+
+        if token["type"] == "valueDuration":
+            return SearchValue(raw_value=parse_duration(token["value"], token["unit"]))
+
+        if token["type"] == "valueRelativeDate":
+            return SearchValue(raw_value=parse_duration(token["value"], token["unit"]))
+
+        if token["type"] == "valueBoolean":
+            return SearchValue(raw_value=int(token["value"].lower() in ("1", "true")))
+
+        if token["type"] == "freeText":
+            if token["quoted"]:
+                # Normalize quotes
+                value = token["value"].replace('\\"', '"')
+            else:
+                # Normalize spacing
+                value = token["value"].strip(" ")
+
+            if value == "":
+                return None
+
+            return SearchFilter(
+                key=SearchKey(name="message"),
                 operator="=",
-                value=SearchValue(raw_value='foo@example.com'),
+                value=SearchValue(raw_value=value),
+            )
+
+    return [token for token in map(node_visitor, result) if token is not None]
+
+
+class ParseSearchQueryTest(SimpleTestCase):
+    """
+    All test cases in this class are dynamically defined via the test fixtures
+    which are shared with the frontend.
+
+    See the `assign_test_case` function.
+    """
+
+    def run_test_case(self, name, case):
+        expected = None
+        expect_error = None
+
+        query = case["query"]
+
+        # We include the path to the test data in the case of failure
+        path = os.path.join(fixture_path, f"{name}.json")
+        failure_help = f'Mismatch for query "{query}"\nExpected test data located in {path}'
+
+        # Generically bad search query that is marked to raise an error
+        if case.get("raisesError"):
+            expect_error = True
+
+        try:
+            expected = result_transformer(case["result"])
+        except InvalidSearchQuery:
+            # If our expected result will raise an InvalidSearchQuery from one
+            # of the filters we handle that here
+            expect_error = True
+
+        if expect_error:
+            with pytest.raises(InvalidSearchQuery):
+                parse_search_query(query)
+            return
+
+        assert parse_search_query(query) == expected, failure_help
+
+
+# Shared test cases which should not be run. Usually because we have a test
+# case in ParseSearchQueryBackendTest that covers something that differs
+# between the backend and frontend parser.
+shared_tests_skipped = [
+    "rel_time_filter",
+    "aggregate_rel_time_filter",
+    "specific_time_filter",
+    "timestamp_rollup",
+    "has_tag",
+    "not_has_tag",
+    "supported_tags",
+    "invalid_aggregate_column_with_duration_filter",
+    "invalid_numeric_aggregate_filter",
+    "disallow_wildcard_filter",
+]
+
+register_fixture_tests(ParseSearchQueryTest, shared_tests_skipped)
+
+
+class ParseSearchQueryBackendTest(SimpleTestCase):
+    """
+    These test cases cannot be represented by the test data used to drive the
+    ParseSearchQueryTest.
+    """
+
+    def test_key_remapping(self):
+        config = SearchConfig(key_mappings={"target_value": ["someValue", "legacy-value"]})
+
+        assert parse_search_query(
+            "someValue:123 legacy-value:456 normal_value:hello", config=config
+        ) == [
+            SearchFilter(
+                key=SearchKey(name="target_value"), operator="=", value=SearchValue("123")
             ),
             SearchFilter(
-                key=SearchKey(name='release'),
-                operator="=",
-                value=SearchValue(raw_value='1.2.1'),
+                key=SearchKey(name="target_value"), operator="=", value=SearchValue("456")
+            ),
+            SearchFilter(
+                key=SearchKey(name="normal_value"), operator="=", value=SearchValue("hello")
             ),
         ]
 
-    def test_raw_search_anywhere(self):
-        assert parse_search_query('hello what user.email:foo@example.com where release:1.2.1 when') == [
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='hello what'),
-            ),
-            SearchFilter(
-                key=SearchKey(name='user.email'),
-                operator="=",
-                value=SearchValue(raw_value='foo@example.com'),
-            ),
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='where'),
-            ),
-            SearchFilter(
-                key=SearchKey(name='release'),
-                operator="=",
-                value=SearchValue(raw_value='1.2.1'),
-            ),
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='when'),
-            ),
-        ]
+    @patch("sentry.search.events.builder.base.BaseQueryBuilder.get_field_type")
+    def test_size_filter(self, mock_type):
+        config = SearchConfig()
+        mock_type.return_value = "gigabyte"
 
-        assert parse_search_query('hello') == [
+        assert parse_search_query("measurements.foo:>5gb measurements.bar:<3pb", config=config) == [
             SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='hello'),
-            ),
-        ]
-
-        assert parse_search_query('  hello  ') == [
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='hello'),
-            ),
-        ]
-
-        assert parse_search_query('  hello   there') == [
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='hello   there'),
-            ),
-        ]
-
-        assert parse_search_query('  hello   there:bye') == [
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='hello'),
-            ),
-            SearchFilter(
-                key=SearchKey(name='there'),
-                operator='=',
-                value=SearchValue(raw_value='bye'),
-            ),
-        ]
-
-    def test_quoted_raw_search_anywhere(self):
-        assert parse_search_query('"hello there" user.email:foo@example.com "general kenobi"') == [
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='hello there'),
-            ),
-            SearchFilter(
-                key=SearchKey(name='user.email'),
-                operator="=",
-                value=SearchValue(raw_value='foo@example.com'),
-            ),
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='general kenobi'),
-            ),
-        ]
-        assert parse_search_query(' " hello " ') == [
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value=' hello '),
-            ),
-        ]
-        assert parse_search_query(' " he\\"llo " ') == [
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value=' he"llo '),
-            ),
-        ]
-
-    def test_timestamp(self):
-        # test date format
-        assert parse_search_query('timestamp>2015-05-18') == [
-            SearchFilter(
-                key=SearchKey(name='timestamp'),
+                key=SearchKey(name="measurements.foo"),
                 operator=">",
-                value=SearchValue(
-                    raw_value=datetime.datetime(
-                        2015,
-                        5,
-                        18,
-                        0,
-                        0,
-                        tzinfo=timezone.utc),
-                ),
+                value=SearchValue(5 * 1000**3),
             ),
-        ]
-        # test date time format
-        assert parse_search_query('timestamp>2015-05-18T10:15:01') == [
             SearchFilter(
-                key=SearchKey(name='timestamp'),
-                operator=">",
-                value=SearchValue(
-                    raw_value=datetime.datetime(
-                        2015,
-                        5,
-                        18,
-                        10,
-                        15,
-                        1,
-                        tzinfo=timezone.utc),
-                ),
+                key=SearchKey(name="measurements.bar"),
+                operator="<",
+                value=SearchValue(3 * 1000**5),
             ),
         ]
 
-        # test date time format w microseconds
-        assert parse_search_query('timestamp>2015-05-18T10:15:01.103') == [
+    @patch("sentry.search.events.builder.base.BaseQueryBuilder.get_field_type")
+    def test_ibyte_size_filter(self, mock_type):
+        config = SearchConfig()
+        mock_type.return_value = "gibibyte"
+
+        assert parse_search_query(
+            "measurements.foo:>5gib measurements.bar:<3pib", config=config
+        ) == [
             SearchFilter(
-                key=SearchKey(name='timestamp'),
+                key=SearchKey(name="measurements.foo"),
                 operator=">",
-                value=SearchValue(
-                    raw_value=datetime.datetime(
-                        2015,
-                        5,
-                        18,
-                        10,
-                        15,
-                        1,
-                        103000,
-                        tzinfo=timezone.utc),
-                ),
+                value=SearchValue(5 * 1024**3),
+            ),
+            SearchFilter(
+                key=SearchKey(name="measurements.bar"),
+                operator="<",
+                value=SearchValue(3 * 1024**5),
             ),
         ]
 
-        # test date time format w microseconds and utc marker
-        assert parse_search_query('timestamp:>2015-05-18T10:15:01.103Z') == [
+    @patch("sentry.search.events.builder.base.BaseQueryBuilder.get_field_type")
+    def test_aggregate_size_filter(self, mock_type):
+        config = SearchConfig()
+        mock_type.return_value = "gigabyte"
+
+        assert parse_search_query(
+            "p50(measurements.foo):>5gb p100(measurements.bar):<3pb", config=config
+        ) == [
             SearchFilter(
-                key=SearchKey(name='timestamp'),
+                key=SearchKey(name="p50(measurements.foo)"),
                 operator=">",
-                value=SearchValue(
-                    raw_value=datetime.datetime(
-                        2015,
-                        5,
-                        18,
-                        10,
-                        15,
-                        1,
-                        103000,
-                        tzinfo=timezone.utc),
-                ),
+                value=SearchValue(5 * 1000**3),
+            ),
+            SearchFilter(
+                key=SearchKey(name="p100(measurements.bar)"),
+                operator="<",
+                value=SearchValue(3 * 1000**5),
             ),
         ]
 
-    def test_other_dates(self):
-        # test date format with other name
-        assert parse_search_query('first_seen>2015-05-18') == [
+    @patch("sentry.search.events.builder.base.BaseQueryBuilder.get_field_type")
+    def test_aggregate_ibyte_size_filter(self, mock_type):
+        config = SearchConfig()
+        mock_type.return_value = "gibibyte"
+
+        assert parse_search_query(
+            "p50(measurements.foo):>5gib p100(measurements.bar):<3pib", config=config
+        ) == [
             SearchFilter(
-                key=SearchKey(name='first_seen'),
+                key=SearchKey(name="p50(measurements.foo)"),
                 operator=">",
-                value=SearchValue(
-                    raw_value=datetime.datetime(
-                        2015,
-                        5,
-                        18,
-                        0,
-                        0,
-                        tzinfo=timezone.utc,
-                    ),
-                ),
+                value=SearchValue(5 * 1024**3),
+            ),
+            SearchFilter(
+                key=SearchKey(name="p100(measurements.bar)"),
+                operator="<",
+                value=SearchValue(3 * 1024**5),
             ),
         ]
 
-        # test colon format
-        assert parse_search_query('first_seen:>2015-05-18') == [
+    @patch("sentry.search.events.builder.base.BaseQueryBuilder.get_field_type")
+    def test_duration_measurement_filter(self, mock_type):
+        config = SearchConfig()
+        mock_type.return_value = "second"
+
+        assert parse_search_query("measurements.foo:>5s measurements.bar:<3m", config=config) == [
             SearchFilter(
-                key=SearchKey(name='first_seen'),
+                key=SearchKey(name="measurements.foo"),
                 operator=">",
-                value=SearchValue(
-                    raw_value=datetime.datetime(
-                        2015,
-                        5,
-                        18,
-                        0,
-                        0,
-                        tzinfo=timezone.utc,
-                    ),
-                ),
+                value=SearchValue(5 * 1000),
+            ),
+            SearchFilter(
+                key=SearchKey(name="measurements.bar"),
+                operator="<",
+                value=SearchValue(3 * 1000 * 60),
             ),
         ]
 
-        assert parse_search_query('random:>2015-05-18') == [
+    @patch("sentry.search.events.builder.base.BaseQueryBuilder.get_field_type")
+    def test_aggregate_duration_measurement_filter(self, mock_type):
+        config = SearchConfig()
+        mock_type.return_value = "minute"
+
+        assert parse_search_query(
+            "p50(measurements.foo):>5s p100(measurements.bar):<3m", config=config
+        ) == [
             SearchFilter(
-                key=SearchKey(name='random'),
-                operator="=",
-                value=SearchValue('>2015-05-18'),
+                key=SearchKey(name="p50(measurements.foo)"),
+                operator=">",
+                value=SearchValue(5 * 1000),
+            ),
+            SearchFilter(
+                key=SearchKey(name="p100(measurements.bar)"),
+                operator="<",
+                value=SearchValue(3 * 1000 * 60),
+            ),
+        ]
+
+    @patch("sentry.search.events.builder.base.BaseQueryBuilder.get_field_type")
+    def test_numeric_measurement_filter(self, mock_type):
+        config = SearchConfig()
+        mock_type.return_value = "number"
+
+        assert parse_search_query("measurements.foo:>5k measurements.bar:<3m", config=config) == [
+            SearchFilter(
+                key=SearchKey(name="measurements.foo"),
+                operator=">",
+                value=SearchValue(5 * 1000),
+            ),
+            SearchFilter(
+                key=SearchKey(name="measurements.bar"),
+                operator="<",
+                value=SearchValue(3 * 1_000_000),
+            ),
+        ]
+
+    @patch("sentry.search.events.builder.base.BaseQueryBuilder.get_field_type")
+    def test_aggregate_numeric_measurement_filter(self, mock_type):
+        config = SearchConfig()
+        mock_type.return_value = "number"
+
+        assert parse_search_query(
+            "p50(measurements.foo):>5k p100(measurements.bar):<3m", config=config
+        ) == [
+            SearchFilter(
+                key=SearchKey(name="p50(measurements.foo)"),
+                operator=">",
+                value=SearchValue(5 * 1000),
+            ),
+            SearchFilter(
+                key=SearchKey(name="p100(measurements.bar)"),
+                operator="<",
+                value=SearchValue(3 * 1_000_000),
             ),
         ]
 
     def test_rel_time_filter(self):
         now = timezone.now()
         with freeze_time(now):
-            assert parse_search_query('first_seen:+7d') == [
+            assert parse_search_query("time:+7d") == [
                 SearchFilter(
-                    key=SearchKey(name='first_seen'),
+                    key=SearchKey(name="time"),
                     operator="<=",
-                    value=SearchValue(
-                        raw_value=now - timedelta(days=7),
-                    ),
-                ),
+                    value=SearchValue(raw_value=now - timedelta(days=7)),
+                )
             ]
-            assert parse_search_query('first_seen:-2w') == [
+            assert parse_search_query("time:-2w") == [
                 SearchFilter(
-                    key=SearchKey(name='first_seen'),
+                    key=SearchKey(name="time"),
                     operator=">=",
-                    value=SearchValue(
-                        raw_value=now - timedelta(days=14),
-                    ),
-                ),
+                    value=SearchValue(raw_value=now - timedelta(days=14)),
+                )
             ]
-            assert parse_search_query('random:-2w') == [
-                SearchFilter(
-                    key=SearchKey(name='random'),
-                    operator="=",
-                    value=SearchValue('-2w'),
-                ),
+            assert parse_search_query("random:-2w") == [
+                SearchFilter(key=SearchKey(name="random"), operator="=", value=SearchValue("-2w"))
             ]
 
-    def test_invalid_date_formats(self):
-        invalid_queries = [
-            'first_seen:hello',
-            'first_seen:123',
-            'first_seen:2018-01-01T00:01ZZ'
-        ]
-        for invalid_query in invalid_queries:
-            with self.assertRaises(
-                InvalidSearchQuery,
-                expected_regex='Invalid format for numeric search',
-            ):
-                parse_search_query(invalid_query)
+    def test_aggregate_rel_time_filter(self):
+        now = timezone.now()
+        with freeze_time(now):
+            assert parse_search_query("last_seen():+7d") == [
+                AggregateFilter(
+                    key=AggregateKey(name="last_seen()"),
+                    operator="<=",
+                    value=SearchValue(raw_value=now - timedelta(days=7)),
+                )
+            ]
+            assert parse_search_query("last_seen():-2w") == [
+                AggregateFilter(
+                    key=AggregateKey(name="last_seen()"),
+                    operator=">=",
+                    value=SearchValue(raw_value=now - timedelta(days=14)),
+                )
+            ]
+            assert parse_search_query("random:-2w") == [
+                SearchFilter(key=SearchKey(name="random"), operator="=", value=SearchValue("-2w"))
+            ]
 
     def test_specific_time_filter(self):
-        assert parse_search_query('first_seen:2018-01-01') == [
+        assert parse_search_query("time:2018-01-01") == [
             SearchFilter(
-                key=SearchKey(name='first_seen'),
+                key=SearchKey(name="time"),
+                operator=">=",
+                value=SearchValue(raw_value=datetime.datetime(2018, 1, 1, tzinfo=datetime.UTC)),
+            ),
+            SearchFilter(
+                key=SearchKey(name="time"),
+                operator="<",
+                value=SearchValue(raw_value=datetime.datetime(2018, 1, 2, tzinfo=datetime.UTC)),
+            ),
+        ]
+
+        assert parse_search_query("time:2018-01-01T05:06:07Z") == [
+            SearchFilter(
+                key=SearchKey(name="time"),
                 operator=">=",
                 value=SearchValue(
-                    raw_value=datetime.datetime(2018, 1, 1, tzinfo=timezone.utc),
+                    raw_value=datetime.datetime(2018, 1, 1, 5, 1, 7, tzinfo=datetime.UTC)
                 ),
             ),
             SearchFilter(
-                key=SearchKey(name='first_seen'),
+                key=SearchKey(name="time"),
                 operator="<",
                 value=SearchValue(
-                    raw_value=datetime.datetime(2018, 1, 2, tzinfo=timezone.utc),
+                    raw_value=datetime.datetime(2018, 1, 1, 5, 12, 7, tzinfo=datetime.UTC)
                 ),
             ),
         ]
 
-        assert parse_search_query('first_seen:2018-01-01T05:06:07') == [
+        assert parse_search_query("time:2018-01-01T05:06:07+00:00") == [
             SearchFilter(
-                key=SearchKey(name='first_seen'),
+                key=SearchKey(name="time"),
                 operator=">=",
                 value=SearchValue(
-                    raw_value=datetime.datetime(2018, 1, 1, 5, 1, 7, tzinfo=timezone.utc),
+                    raw_value=datetime.datetime(2018, 1, 1, 5, 1, 7, tzinfo=datetime.UTC)
                 ),
             ),
             SearchFilter(
-                key=SearchKey(name='first_seen'),
+                key=SearchKey(name="time"),
                 operator="<",
                 value=SearchValue(
-                    raw_value=datetime.datetime(2018, 1, 1, 5, 12, 7, tzinfo=timezone.utc),
+                    raw_value=datetime.datetime(2018, 1, 1, 5, 12, 7, tzinfo=datetime.UTC)
                 ),
             ),
         ]
 
-        assert parse_search_query('random:2018-01-01T05:06:07') == [
+        assert parse_search_query("random:2018-01-01T05:06:07") == [
             SearchFilter(
-                key=SearchKey(name='random'),
+                key=SearchKey(name="random"),
                 operator="=",
-                value=SearchValue(raw_value='2018-01-01T05:06:07'),
-            ),
+                value=SearchValue(raw_value="2018-01-01T05:06:07"),
+            )
         ]
 
-    def test_quoted_val(self):
-        assert parse_search_query('release:"a release"') == [
+    def test_timestamp_rollup(self):
+        assert parse_search_query("timestamp.to_hour:2018-01-01T05:06:07+00:00") == [
             SearchFilter(
-                key=SearchKey(name='release'),
-                operator='=',
-                value=SearchValue(raw_value='a release'),
-            ),
-        ]
-        assert parse_search_query('!release:"a release"') == [
-            SearchFilter(
-                key=SearchKey(name='release'),
-                operator='!=',
-                value=SearchValue('a release'),
-            ),
-        ]
-
-    def test_quoted_key(self):
-        assert parse_search_query('"hi:there":value') == [
-            SearchFilter(
-                key=SearchKey(name='hi:there'),
-                operator='=',
-                value=SearchValue(raw_value='value'),
-            ),
-        ]
-        assert parse_search_query('!"hi:there":value') == [
-            SearchFilter(
-                key=SearchKey(name='hi:there'),
-                operator='!=',
-                value=SearchValue(raw_value='value'),
-            ),
-        ]
-
-    def test_newline_within_quote(self):
-        assert parse_search_query('release:"a\nrelease"') == [
-            SearchFilter(
-                key=SearchKey(name='release'),
-                operator='=',
-                value=SearchValue(raw_value='a\nrelease')
-            ),
-        ]
-
-    def test_newline_outside_quote(self):
-        with self.assertRaises(InvalidSearchQuery):
-            parse_search_query('release:a\nrelease')
-
-    def test_tab_within_quote(self):
-        assert parse_search_query('release:"a\trelease"') == [
-            SearchFilter(
-                key=SearchKey(name='release'),
-                operator='=',
-                value=SearchValue(raw_value='a\trelease')
-            ),
-        ]
-
-    def test_tab_outside_quote(self):
-        # tab outside quote
-        assert parse_search_query('release:a\trelease') == [
-            SearchFilter(
-                key=SearchKey(name='release'),
-                operator='=',
-                value=SearchValue(raw_value='a'),
+                key=SearchKey(name="timestamp.to_hour"),
+                operator=">=",
+                value=SearchValue(
+                    raw_value=datetime.datetime(2018, 1, 1, 5, 1, 7, tzinfo=datetime.UTC)
+                ),
             ),
             SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='\trelease')
-            ),
-        ]
-
-    def test_escaped_quotes(self):
-        assert parse_search_query('release:"a\\"thing\\""') == [
-            SearchFilter(
-                key=SearchKey(name='release'),
-                operator='=',
-                value=SearchValue(raw_value='a"thing"')
-            ),
-        ]
-        assert parse_search_query('release:"a\\"\\"release"') == [
-            SearchFilter(
-                key=SearchKey(name='release'),
-                operator='=',
-                value=SearchValue(raw_value='a""release')
-            ),
-        ]
-
-    def test_multiple_quotes(self):
-        assert parse_search_query('device.family:"" browser.name:"Chrome"') == [
-            SearchFilter(
-                key=SearchKey(name='device.family'),
-                operator='=',
-                value=SearchValue(raw_value=''),
-            ),
-            SearchFilter(
-                key=SearchKey(name='browser.name'),
-                operator='=',
-                value=SearchValue(raw_value='Chrome'),
-            ),
-        ]
-
-        assert parse_search_query('device.family:"\\"" browser.name:"Chrome"') == [
-            SearchFilter(
-                key=SearchKey(name='device.family'),
-                operator='=',
-                value=SearchValue(raw_value='"'),
-            ),
-            SearchFilter(
-                key=SearchKey(name='browser.name'),
-                operator='=',
-                value=SearchValue(raw_value='Chrome'),
-            ),
-        ]
-
-    def test_sooo_many_quotes(self):
-        assert parse_search_query('device.family:"\\"\\"\\"\\"\\"\\"\\"\\"\\"\\""') == [
-            SearchFilter(
-                key=SearchKey(name='device.family'),
-                operator='=',
-                value=SearchValue(raw_value='""""""""""'),
-            ),
-        ]
-
-    def test_empty_filter_value(self):
-        assert parse_search_query('device.family:""') == [
-            SearchFilter(
-                key=SearchKey(name='device.family'),
-                operator='=',
-                value=SearchValue(raw_value=''),
-            ),
-        ]
-
-    def test_custom_tag(self):
-        assert parse_search_query('fruit:apple release:1.2.1') == [
-            SearchFilter(
-                key=SearchKey(name='fruit'),
-                operator='=',
-                value=SearchValue(raw_value='apple'),
-            ),
-            SearchFilter(
-                key=SearchKey(name='release'),
-                operator='=',
-                value=SearchValue(raw_value='1.2.1'),
+                key=SearchKey(name="timestamp.to_hour"),
+                operator="<",
+                value=SearchValue(
+                    raw_value=datetime.datetime(2018, 1, 1, 5, 12, 7, tzinfo=datetime.UTC)
+                ),
             ),
         ]
 
     def test_has_tag(self):
         # unquoted key
-        assert parse_search_query('has:release') == [
+        assert parse_search_query("has:release") == [
             SearchFilter(
-                key=SearchKey(name='release'),
-                operator='!=',
-                value=SearchValue(raw_value=''),
-            ),
+                key=SearchKey(name="release"), operator="!=", value=SearchValue(raw_value="")
+            )
         ]
 
         # quoted key
         assert parse_search_query('has:"hi:there"') == [
             SearchFilter(
-                key=SearchKey(name='hi:there'),
-                operator='!=',
-                value=SearchValue(raw_value=''),
-            ),
+                key=SearchKey(name="hi:there"), operator="!=", value=SearchValue(raw_value="")
+            )
         ]
 
         # malformed key
-        with self.assertRaises(InvalidSearchQuery):
+        with pytest.raises(InvalidSearchQuery):
             parse_search_query('has:"hi there"')
 
     def test_not_has_tag(self):
         # unquoted key
-        assert parse_search_query('!has:release') == [
-            SearchFilter(
-                key=SearchKey(name='release'),
-                operator='=',
-                value=SearchValue(''),
-            ),
+        assert parse_search_query("!has:release") == [
+            SearchFilter(key=SearchKey(name="release"), operator="=", value=SearchValue(""))
         ]
 
         # quoted key
         assert parse_search_query('!has:"hi:there"') == [
-            SearchFilter(
-                key=SearchKey(name='hi:there'),
-                operator='=',
-                value=SearchValue(''),
-            ),
+            SearchFilter(key=SearchKey(name="hi:there"), operator="=", value=SearchValue(""))
         ]
+
+    def test_allowed_keys(self):
+        config = SearchConfig(allowed_keys=["good_key"])
+
+        assert parse_search_query("good_key:123 bad_key:123 text") == [
+            SearchFilter(key=SearchKey(name="good_key"), operator="=", value=SearchValue("123")),
+            SearchFilter(key=SearchKey(name="bad_key"), operator="=", value=SearchValue("123")),
+            SearchFilter(key=SearchKey(name="message"), operator="=", value=SearchValue("text")),
+        ]
+
+        with pytest.raises(InvalidSearchQuery, match="Invalid key for this search"):
+            assert parse_search_query("good_key:123 bad_key:123 text", config=config)
+
+        assert parse_search_query("good_key:123 text", config=config) == [
+            SearchFilter(key=SearchKey(name="good_key"), operator="=", value=SearchValue("123")),
+            SearchFilter(key=SearchKey(name="message"), operator="=", value=SearchValue("text")),
+        ]
+
+    def test_blocked_keys(self):
+        config = SearchConfig(blocked_keys=["bad_key"])
+
+        assert parse_search_query("some_key:123 bad_key:123 text") == [
+            SearchFilter(key=SearchKey(name="some_key"), operator="=", value=SearchValue("123")),
+            SearchFilter(key=SearchKey(name="bad_key"), operator="=", value=SearchValue("123")),
+            SearchFilter(key=SearchKey(name="message"), operator="=", value=SearchValue("text")),
+        ]
+
+        with pytest.raises(InvalidSearchQuery, match="Invalid key for this search: bad_key"):
+            assert parse_search_query("some_key:123 bad_key:123 text", config=config)
+
+        assert parse_search_query("some_key:123 some_other_key:456 text", config=config) == [
+            SearchFilter(key=SearchKey(name="some_key"), operator="=", value=SearchValue("123")),
+            SearchFilter(
+                key=SearchKey(name="some_other_key"), operator="=", value=SearchValue("456")
+            ),
+            SearchFilter(key=SearchKey(name="message"), operator="=", value=SearchValue("text")),
+        ]
+
+    def test_invalid_aggregate_column_with_duration_filter(self):
+        with self.assertRaisesMessage(
+            InvalidSearchQuery,
+            expected_message="avg: column argument invalid: stack.colno is not a numeric column",
+        ):
+            parse_search_query("avg(stack.colno):>500s")
+
+    def test_invalid_numeric_aggregate_filter(self):
+        with self.assertRaisesMessage(
+            InvalidSearchQuery, "is not a valid number suffix, must be k, m or b"
+        ):
+            parse_search_query("min(measurements.size):3s")
+
+        with self.assertRaisesMessage(
+            InvalidSearchQuery, "is not a valid number suffix, must be k, m or b"
+        ):
+            parse_search_query("count_if(measurements.fcp, greater, 5s):3s")
 
     def test_is_query_unsupported(self):
-        with self.assertRaises(InvalidSearchQuery):
-            parse_search_query('is:unassigned')
+        with pytest.raises(
+            InvalidSearchQuery, match=".*queries are not supported in this search.*"
+        ):
+            parse_search_query("is:unassigned")
 
-    def test_key_remapping(self):
-        class RemapVisitor(SearchVisitor):
-            key_mappings = {
-                'target_value': ['someValue', 'legacy-value'],
-            }
-
-        tree = event_search_grammar.parse('someValue:123 legacy-value:456 normal_value:hello')
-        assert RemapVisitor().visit(tree) == [
-            SearchFilter(
-                key=SearchKey(name='target_value'),
-                operator='=',
-                value=SearchValue('123'),
-            ),
-            SearchFilter(
-                key=SearchKey(name='target_value'),
-                operator='=',
-                value=SearchValue('456'),
-            ),
-            SearchFilter(
-                key=SearchKey(name='normal_value'),
-                operator='=',
-                value=SearchValue('hello'),
-            ),
+    def test_escaping_asterisk(self):
+        # the asterisk is escaped with a preceding backslash, so it's a literal and not a wildcard
+        search_filters = parse_search_query(r"title:a\*b")
+        assert search_filters == [
+            SearchFilter(key=SearchKey(name="title"), operator="=", value=SearchValue(r"a\*b"))
         ]
+        search_filter = search_filters[0]
+        # the slash should be removed in the final value
+        assert search_filter.value.value == "a*b"
 
-    def test_numeric_filter(self):
-        # Numeric format should still return a string if field isn't whitelisted
-        assert parse_search_query('random_field:>500') == [
-            SearchFilter(
-                key=SearchKey(name='random_field'),
-                operator="=",
-                value=SearchValue(raw_value='>500'),
-            ),
+        # the first and last asterisks arent escaped with a preceding backslash, so they're
+        # wildcards and not literals
+        search_filters = parse_search_query(r"title:*\**")
+        assert search_filters == [
+            SearchFilter(key=SearchKey(name="title"), operator="=", value=SearchValue(r"*\**"))
         ]
+        search_filter = search_filters[0]
+        assert search_filter.value.value == r"^.*\*.*$"
 
-    def test_quotes_filtered_on_raw(self):
-        # Enclose the full raw query? Strip it.
-        assert parse_search_query('thinger:unknown "what is this?"') == [
-            SearchFilter(
-                key=SearchKey(name='thinger'),
-                operator='=',
-                value=SearchValue(raw_value='unknown'),
-            ),
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='what is this?'),
-            ),
+    @pytest.mark.xfail(reason="escaping backslashes is not supported yet")
+    def test_escaping_backslashes(self):
+        search_filters = parse_search_query(r"title:a\\b")
+        assert search_filters == [
+            SearchFilter(key=SearchKey(name="title"), operator="=", value=SearchValue(r"a\\b"))
         ]
+        search_filter = search_filters[0]
+        # the extra slash should be removed in the final value
+        assert search_filter.value.value == r"a\b"
 
-        # Enclose the full query? Strip it and the whole query is raw.
-        assert parse_search_query('"thinger:unknown what is this?"') == [
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='thinger:unknown what is this?'),
-            ),
+    @pytest.mark.xfail(reason="escaping backslashes is not supported yet")
+    def test_trailing_escaping_backslashes(self):
+        search_filters = parse_search_query(r"title:a\\")
+        assert search_filters == [
+            SearchFilter(key=SearchKey(name="title"), operator="=", value=SearchValue(r"a\\"))
         ]
+        search_filter = search_filters[0]
+        # the extra slash should be removed in the final value
+        assert search_filter.value.value == "a\\"
 
-        # Allow a single quotation at end
-        assert parse_search_query('end"') == [
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='end"'),
-            ),
+    def test_escaping_quotes(self):
+        search_filters = parse_search_query(r"title:a\"b")
+        assert search_filters == [
+            SearchFilter(key=SearchKey(name="title"), operator="=", value=SearchValue(r'a"b'))
         ]
-
-        # Allow a single quotation at beginning
-        assert parse_search_query('"beginning') == [
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='"beginning'),
-            ),
-        ]
-
-        # Allow a single quotation
-        assert parse_search_query('"') == [
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='"'),
-            ),
-        ]
-
-        # Empty quotations become a dropped term
-        assert parse_search_query('""') == []
-
-        # Allow a search for space
-        assert parse_search_query('" "') == [
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value=' '),
-            ),
-        ]
-
-        # Strip in a balanced manner
-        assert parse_search_query('""woof"') == [
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='woof"'),
-            ),
-        ]
-
-        # Don't try this at home kids
-        assert parse_search_query('"""""""""') == [
-            SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(raw_value='"'),
-            ),
-        ]
-
-    def _build_search_filter(self, key_name, operator, value):
-        return SearchFilter(
-            key=SearchKey(name=key_name),
-            operator=operator,
-            value=SearchValue(raw_value=value),
-        )
-
-    def test_basic_fallthrough(self):
-        # These should all fall through to basic equal searches, even though they
-        # look like numeric, date, etc.
-        queries = [
-            ('random:<hello', self._build_search_filter('random', '=', '<hello')),
-            ('random:<512.1.0', self._build_search_filter('random', '=', '<512.1.0')),
-            ('random:2018-01-01', self._build_search_filter('random', '=', '2018-01-01')),
-            ('random:+7d', self._build_search_filter('random', '=', '+7d')),
-            ('random:>2018-01-01', self._build_search_filter('random', '=', '>2018-01-01')),
-            ('random:2018-01-01', self._build_search_filter('random', '=', '2018-01-01')),
-            ('random:hello', self._build_search_filter('random', '=', 'hello')),
-            ('random:123', self._build_search_filter('random', '=', '123')),
-        ]
-        for query, expected in queries:
-            assert parse_search_query(query) == [expected]
-
-    def test_empty_string(self):
-        # Empty quotations become a dropped term
-        assert parse_search_query('') == []
+        search_filter = search_filters[0]
+        # the slash should be removed in the final value
+        assert search_filter.value.value == 'a"b'
 
 
-class ParseBooleanSearchQueryTest(TestCase):
-    def setUp(self):
-        super(ParseBooleanSearchQueryTest, self).setUp()
-        self.term1 = SearchFilter(
-            key=SearchKey(name='user.email'),
-            operator="=",
-            value=SearchValue(raw_value='foo@example.com'),
-        )
-        self.term2 = SearchFilter(
-            key=SearchKey(name='user.email'),
-            operator="=",
-            value=SearchValue(raw_value='bar@example.com'),
-        )
-        self.term3 = SearchFilter(
-            key=SearchKey(name='user.email'),
-            operator="=",
-            value=SearchValue(raw_value='foobar@example.com'),
-        )
-        self.term4 = SearchFilter(
-            key=SearchKey(name='user.email'),
-            operator="=",
-            value=SearchValue(raw_value='hello@example.com'),
-        )
-        self.term5 = SearchFilter(
-            key=SearchKey(name='user.email'),
-            operator="=",
-            value=SearchValue(raw_value='hi@example.com'),
-        )
-
-    def test_simple(self):
-        assert parse_search_query(
-            'user.email:foo@example.com OR user.email:bar@example.com'
-        ) == [SearchBoolean(left_term=self.term1, operator="OR", right_term=self.term2)]
-
-        assert parse_search_query(
-            'user.email:foo@example.com AND user.email:bar@example.com'
-        ) == [SearchBoolean(left_term=self.term1, operator="AND", right_term=self.term2)]
-
-    def test_single_term(self):
-        assert parse_search_query('user.email:foo@example.com') == [self.term1]
-
-    def test_order_of_operations(self):
-        assert parse_search_query(
-            'user.email:foo@example.com OR user.email:bar@example.com AND user.email:foobar@example.com'
-        ) == [SearchBoolean(
-            left_term=self.term1,
-            operator='OR',
-            right_term=SearchBoolean(
-                left_term=self.term2,
-                operator='AND',
-                right_term=self.term3
-            )
-        )]
-        assert parse_search_query(
-            'user.email:foo@example.com AND user.email:bar@example.com OR user.email:foobar@example.com'
-        ) == [SearchBoolean(
-            left_term=SearchBoolean(
-                left_term=self.term1,
-                operator='AND',
-                right_term=self.term2,
-            ),
-            operator='OR',
-            right_term=self.term3
-        )]
-
-    def test_multiple_statements(self):
-        assert parse_search_query(
-            'user.email:foo@example.com OR user.email:bar@example.com OR user.email:foobar@example.com'
-        ) == [SearchBoolean(
-            left_term=self.term1,
-            operator='OR',
-            right_term=SearchBoolean(
-                left_term=self.term2,
-                operator='OR',
-                right_term=self.term3
-            )
-        )]
-
-        assert parse_search_query(
-            'user.email:foo@example.com AND user.email:bar@example.com AND user.email:foobar@example.com'
-        ) == [SearchBoolean(
-            left_term=self.term1,
-            operator='AND',
-            right_term=SearchBoolean(
-                left_term=self.term2,
-                operator='AND',
-                right_term=self.term3
-            )
-        )]
-
-        # longer even number of terms
-        assert parse_search_query(
-            'user.email:foo@example.com AND user.email:bar@example.com OR user.email:foobar@example.com AND user.email:hello@example.com'
-        ) == [SearchBoolean(
-            left_term=SearchBoolean(
-                left_term=self.term1,
-                operator='AND',
-                right_term=self.term2
-            ),
-            operator='OR',
-            right_term=SearchBoolean(
-                left_term=self.term3,
-                operator='AND',
-                right_term=self.term4
-            )
-        )]
-
-        # longer odd number of terms
-        assert parse_search_query(
-            'user.email:foo@example.com AND user.email:bar@example.com OR user.email:foobar@example.com AND user.email:hello@example.com AND user.email:hi@example.com'
-        ) == [
-            SearchBoolean(
-                left_term=SearchBoolean(
-                    left_term=self.term1,
-                    operator='AND',
-                    right_term=self.term2
-                ),
-                operator='OR',
-                right_term=SearchBoolean(
-                    left_term=self.term3,
-                    operator='AND',
-                    right_term=SearchBoolean(
-                        left_term=self.term4,
-                        operator='AND',
-                        right_term=self.term5
-                    )
-                )
-            )]
-
-        # absurdly long
-        assert parse_search_query(
-            'user.email:foo@example.com AND user.email:bar@example.com OR user.email:foobar@example.com AND user.email:hello@example.com AND user.email:hi@example.com OR user.email:foo@example.com AND user.email:bar@example.com OR user.email:foobar@example.com AND user.email:hello@example.com AND user.email:hi@example.com'
-        ) == [SearchBoolean(
-            left_term=SearchBoolean(
-                left_term=self.term1,
-                operator='AND',
-                right_term=self.term2),
-            operator='OR',
-            right_term=SearchBoolean(
-                left_term=SearchBoolean(
-                    left_term=self.term3,
-                    operator='AND',
-                    right_term=SearchBoolean(
-                        left_term=self.term4,
-                        operator='AND',
-                        right_term=self.term5)),
-                operator='OR',
-                right_term=SearchBoolean(
-                    left_term=SearchBoolean(
-                        left_term=self.term1,
-                        operator='AND',
-                        right_term=self.term2),
-                    operator='OR',
-                    right_term=SearchBoolean(
-                        left_term=self.term3,
-                        operator='AND',
-                        right_term=SearchBoolean(
-                            left_term=self.term4,
-                            operator='AND',
-                            right_term=self.term5
-                        )
-                    )
-                )
-            )
-        )]
-
-    def test_grouping_simple(self):
-        result = parse_search_query(
-            '(user.email:foo@example.com OR user.email:bar@example.com)'
-        )
-        assert result == [SearchBoolean(left_term=self.term1, operator="OR", right_term=self.term2)]
-        result = parse_search_query(
-            '(user.email:foo@example.com OR user.email:bar@example.com) AND user.email:foobar@example.com'
-        )
-        assert result == [SearchBoolean(
-            left_term=SearchBoolean(
-                left_term=self.term1,
-                operator='OR',
-                right_term=self.term2),
-            operator='AND',
-            right_term=self.term3)]
-
-        result = parse_search_query(
-            'user.email:foo@example.com AND (user.email:bar@example.com OR user.email:foobar@example.com)'
-        )
-        assert result == [SearchBoolean(
-            left_term=self.term1,
-            operator='AND',
-            right_term=SearchBoolean(
-                left_term=self.term2,
-                operator='OR',
-                right_term=self.term3))]
-
-    def test_nested_grouping(self):
-        result = parse_search_query(
-            '(user.email:foo@example.com OR (user.email:bar@example.com OR user.email:foobar@example.com))'
-        )
-        assert result == [SearchBoolean(
-            left_term=self.term1,
-            operator="OR",
-            right_term=SearchBoolean(
-                left_term=self.term2,
-                operator="OR",
-                right_term=self.term3))
-        ]
-        result = parse_search_query(
-            '(user.email:foo@example.com OR (user.email:bar@example.com OR (user.email:foobar@example.com AND user.email:hello@example.com OR user.email:hi@example.com)))'
-        )
-        assert result == [SearchBoolean(
-            left_term=self.term1,
-            operator="OR",
-            right_term=SearchBoolean(
-                left_term=self.term2,
-                operator="OR",
-                right_term=SearchBoolean(
-                    left_term=SearchBoolean(
-                        left_term=self.term3,
-                        operator="AND",
-                        right_term=self.term4
-                    ),
-                    operator="OR",
-                    right_term=self.term5,
-                )
-            )
-        )]
-
-    def test_malformed_groups(self):
-        with pytest.raises(InvalidSearchQuery) as error:
-            parse_search_query(
-                '(user.email:foo@example.com OR user.email:bar@example.com'
-            )
-        assert six.text_type(
-            error.value) == "Parse error: 'search' (column 1). This is commonly caused by unmatched-parentheses. Enclose any text in double quotes."
-        with pytest.raises(InvalidSearchQuery) as error:
-            parse_search_query(
-                '((user.email:foo@example.com OR user.email:bar@example.com AND  user.email:bar@example.com)'
-            )
-        assert six.text_type(
-            error.value) == "Parse error: 'search' (column 1). This is commonly caused by unmatched-parentheses. Enclose any text in double quotes."
-        with pytest.raises(InvalidSearchQuery) as error:
-            parse_search_query(
-                'user.email:foo@example.com OR user.email:bar@example.com)'
-            )
-        assert six.text_type(
-            error.value) == "Parse error: 'search' (column 57). This is commonly caused by unmatched-parentheses. Enclose any text in double quotes."
-        with pytest.raises(InvalidSearchQuery) as error:
-            parse_search_query(
-                '(user.email:foo@example.com OR user.email:bar@example.com AND  user.email:bar@example.com))'
-            )
-        assert six.text_type(
-            error.value) == "Parse error: 'search' (column 91). This is commonly caused by unmatched-parentheses. Enclose any text in double quotes."
-
-    def test_grouping_without_boolean_terms(self):
-        with pytest.raises(InvalidSearchQuery) as error:
-            parse_search_query(
-                'undefined is not an object (evaluating \'function.name\')'
-            ) == [SearchFilter(
-                key=SearchKey(name='message'),
-                operator='=',
-                value=SearchValue(
-                    raw_value='undefined is not an object (evaluating "function.name")'),
-            )]
-        assert six.text_type(
-            error.value) == "Parse error: 'search' (column 28). This is commonly caused by unmatched-parentheses. Enclose any text in double quotes."
+@pytest.mark.parametrize(
+    "raw,result",
+    [
+        (r"", r""),
+        (r"foo", r"foo"),
+        (r"foo*bar", r"^foo.*bar$"),
+        (r"foo\*bar", r"foo*bar"),
+        (r"foo\\*bar", r"^foo\\.*bar$"),
+        (r"foo\\\*bar", r"foo\\*bar"),
+        (r"foo*", r"^foo.*$"),
+        (r"foo\*", r"foo*"),
+        (r"foo\\*", r"^foo\\.*$"),
+        (r"foo\\\*", r"foo\\*"),
+        (r"*bar", r"^.*bar$"),
+        (r"\*bar", r"*bar"),
+        (r"\\*bar", r"^\\.*bar$"),
+        (r"\\\*bar", r"\\*bar"),
+        (r"*\**", r"^.*\*.*$"),
+        (r"\*a\*b\*c\*", r"*a*b*c*"),
+        (r"\*\*\*aaa\*\*\*", r"***aaa***"),
+    ],
+)
+def test_search_value(raw, result):
+    search_value = SearchValue(raw)
+    assert search_value.value == result
 
 
-class GetSnubaQueryArgsTest(TestCase):
-    def test_simple(self):
-        assert get_snuba_query_args('user.email:foo@example.com release:1.2.1 fruit:apple hello', {
-            'project_id': [1, 2, 3],
-            'start': datetime.datetime(2015, 5, 18, 10, 15, 1, tzinfo=timezone.utc),
-            'end': datetime.datetime(2015, 5, 19, 10, 15, 1, tzinfo=timezone.utc),
-        }) == {
-            'conditions': [
-                ['email', '=', 'foo@example.com'],
-                ['tags[sentry:release]', '=', '1.2.1'],
-                [['ifNull', ['tags[fruit]', "''"]], '=', 'apple'],
-                [['positionCaseInsensitive', ['message', "'hello'"]], '!=', 0],
-            ],
-            'filter_keys': {'project_id': [1, 2, 3]},
-            'start': datetime.datetime(2015, 5, 18, 10, 15, 1, tzinfo=timezone.utc),
-            'end': datetime.datetime(2015, 5, 19, 10, 15, 1, tzinfo=timezone.utc),
-        }
+@pytest.mark.parametrize(
+    "query",
+    [
+        "event.type:=transaction",
+        "!event.type:[transaction]",
+        "event.type:[transaction, event]",
+        "event.type:[1, 2]",
+        "transaction.duration:>=1.0",
+        "transaction.duration:>1.0",
+        "transaction.duration:=1.0",
+        "transaction.duration:<=1.0",
+        "transaction.duration:<1.0",
+    ],
+)
+def test_search_filter_to_query_string(query):
+    """
+    Does a round trip (from query string to tokens and back to query string)
+    """
 
-    def test_negation(self):
-        assert get_snuba_query_args('!user.email:foo@example.com') == {
-            'conditions': [
-                [
-                    [['isNull', ['email']], '=', 1],
-                    ['email', '!=', 'foo@example.com']
-                ]
-            ],
-            'filter_keys': {},
-        }
-
-    def test_no_search(self):
-        assert get_snuba_query_args(params={
-            'project_id': [1, 2, 3],
-            'start': datetime.datetime(2015, 5, 18, 10, 15, 1, tzinfo=timezone.utc),
-            'end': datetime.datetime(2015, 5, 19, 10, 15, 1, tzinfo=timezone.utc),
-        }) == {
-            'conditions': [],
-            'filter_keys': {'project_id': [1, 2, 3]},
-            'start': datetime.datetime(2015, 5, 18, 10, 15, 1, tzinfo=timezone.utc),
-            'end': datetime.datetime(2015, 5, 19, 10, 15, 1, tzinfo=timezone.utc),
-        }
-
-    def test_wildcard(self):
-        assert get_snuba_query_args('release:3.1.* user.email:*@example.com') == {
-            'conditions': [
-                [['match', ['tags[sentry:release]', "'(?i)^3\\.1\\..*$'"]], '=', 1],
-                [['match', ['email', "'(?i)^.*\\@example\\.com$'"]], '=', 1],
-            ],
-            'filter_keys': {},
-        }
-
-    def test_negated_wildcard(self):
-        assert get_snuba_query_args('!release:3.1.* user.email:*@example.com') == {
-            'conditions': [
-                [
-                    [['isNull', ['tags[sentry:release]']], '=', 1],
-                    [['match', ['tags[sentry:release]', "'(?i)^3\\.1\\..*$'"]], '!=', 1]
-                ],
-                [['match', ['email', "'(?i)^.*\\@example\\.com$'"]], '=', 1]
-            ],
-            'filter_keys': {},
-        }
-
-    def test_escaped_wildcard(self):
-        assert get_snuba_query_args('release:3.1.\\* user.email:\\*@example.com') == {
-            'conditions': [
-                [['match', ['tags[sentry:release]', "'(?i)^3\\.1\\.\\*$'"]], '=', 1],
-                [['match', ['email', "'(?i)^\*\\@example\\.com$'"]], '=', 1],
-            ],
-            'filter_keys': {},
-        }
-        assert get_snuba_query_args('release:\\\\\\*') == {
-            'conditions': [
-                [['match', ['tags[sentry:release]', "'(?i)^\\\\\\*$'"]], '=', 1],
-            ],
-            'filter_keys': {},
-        }
-        assert get_snuba_query_args('release:\\\\*') == {
-            'conditions': [
-                [['match', ['tags[sentry:release]', "'(?i)^\\\\.*$'"]], '=', 1],
-            ],
-            'filter_keys': {},
-        }
-
-    def test_has(self):
-        assert get_snuba_query_args('has:release') == {
-            'filter_keys': {},
-            'conditions': [[['isNull', ['tags[sentry:release]']], '!=', 1]]
-        }
-
-    def test_not_has(self):
-        assert get_snuba_query_args('!has:release') == {
-            'filter_keys': {},
-            'conditions': [[['isNull', ['tags[sentry:release]']], '=', 1]]
-        }
-
-    def test_message_negative(self):
-        assert get_snuba_query_args('!message:"post_process.process_error HTTPError 403"') == {
-            'filter_keys': {},
-            'conditions': [[
-                ['positionCaseInsensitive', ['message', "'post_process.process_error HTTPError 403'"]],
-                '=',
-                0,
-            ]]
-        }
-
-    def test_malformed_groups(self):
-        with pytest.raises(InvalidSearchQuery):
-            get_snuba_query_args('(user.email:foo@example.com OR user.email:bar@example.com')
-
-    def test_boolean_term_simple(self):
-        assert get_snuba_query_args('user.email:foo@example.com AND user.email:bar@example.com') == {
-            'conditions': [
-                ['and', [
-                    ['email', '=', 'foo@example.com'],
-                    ['email', '=', 'bar@example.com']
-                ]]
-            ],
-            'filter_keys': {},
-            'has_boolean_terms': True,
-        }
-        assert get_snuba_query_args('user.email:foo@example.com OR user.email:bar@example.com') == {
-            'conditions': [
-                ['or', [
-                    ['email', '=', 'foo@example.com'],
-                    ['email', '=', 'bar@example.com']
-                ]]
-            ],
-            'filter_keys': {},
-            'has_boolean_terms': True,
-        }
-        assert get_snuba_query_args(
-            'user.email:foo@example.com AND user.email:bar@example.com OR user.email:foobar@example.com AND user.email:hello@example.com AND user.email:hi@example.com OR user.email:foo@example.com AND user.email:bar@example.com OR user.email:foobar@example.com AND user.email:hello@example.com AND user.email:hi@example.com'
-        ) == {
-            'conditions': [
-                ['or', [
-                    ['and', [
-                        ['email', '=', 'foo@example.com'],
-                        ['email', '=', 'bar@example.com']
-                    ]],
-                    ['or', [
-                        ['and', [
-                            ['email', '=', 'foobar@example.com'],
-                            ['and', [
-                                ['email', '=', 'hello@example.com'],
-                                ['email', '=', 'hi@example.com']
-                            ]]
-                        ]],
-                        ['or', [
-                            ['and', [
-                                ['email', '=', 'foo@example.com'],
-                                ['email', '=', 'bar@example.com']
-                            ]],
-                            ['and', [
-                                ['email', '=', 'foobar@example.com'],
-                                ['and', [
-                                    ['email', '=', 'hello@example.com'],
-                                    ['email', '=', 'hi@example.com']
-                                ]]
-                            ]]
-                        ]]
-                    ]]
-                ]]
-            ],
-            'filter_keys': {},
-            'has_boolean_terms': True,
-        }
-
-    def test_issue_filter(self):
-        assert get_snuba_query_args('issue.id:1') == {
-            'conditions': [],
-            'filter_keys': {
-                'issue': [1],
-            },
-        }
-
-        assert get_snuba_query_args('issue.id:1 issue.id:2 issue.id:3') == {
-            'conditions': [],
-            'filter_keys': {
-                'issue': [1, 2, 3],
-            },
-        }
-
-        assert get_snuba_query_args('issue.id:1 user.email:foo@example.com') == {
-            'conditions': [
-                ['email', '=', 'foo@example.com']
-            ],
-            'filter_keys': {
-                'issue': [1],
-            },
-        }
-
-    def test_project_name(self):
-        p1 = self.create_project(organization=self.organization)
-        p2 = self.create_project(organization=self.organization)
-
-        params = {
-            'project_id': [p1.id, p2.id],
-        }
-        assert get_snuba_query_args('project.name:{}'.format(p1.slug), params) == {
-            'conditions': [['project_id', '=', p1.id]],
-            'filter_keys': {
-                'project_id': [p1.id, p2.id],
-            }
-        }
+    filters = parse_search_query(query)
+    assert len(filters) == 1
+    actual = filters[0].to_query_string()
+    assert actual == query
 
 
-class ConvertEndpointParamsTests(TestCase):
-    def test_simple(self):
-        assert convert_endpoint_params({
-            'project_id': [1, 2, 3],
-            'start': datetime.datetime(2015, 5, 18, 10, 15, 1, tzinfo=timezone.utc),
-            'end': datetime.datetime(2015, 5, 19, 10, 15, 1, tzinfo=timezone.utc),
-        }) == [
-            SearchFilter(
-                key=SearchKey(name='start'),
-                operator='=',
-                value=SearchValue(
-                    raw_value=datetime.datetime(
-                        2015,
-                        5,
-                        18,
-                        10,
-                        15,
-                        1,
-                        tzinfo=timezone.utc),
-                )
-            ),
-            SearchFilter(
-                key=SearchKey(name='project_id'),
-                operator='=',
-                value=SearchValue(raw_value=[1, 2, 3])
-            ),
-            SearchFilter(
-                key=SearchKey(name='end'),
-                operator='=',
-                value=SearchValue(
-                    raw_value=datetime.datetime(
-                        2015,
-                        5,
-                        19,
-                        10,
-                        15,
-                        1,
-                        tzinfo=timezone.utc),
-                )
-            ),
-        ]
+@pytest.mark.parametrize(
+    "value,expected_query_string",
+    [
+        (1, "1"),
+        ("abc", "abc"),
+        ([1, 2, 3], "[1, 2, 3]"),
+        (["a", "b", "c"], "[a, b, c]"),
+        (datetime.datetime(2023, 10, 15, 11, 12, 13), "2023-10-15T11:12:13"),
+    ],
+)
+def test_search_value_to_query_string(value, expected_query_string):
+    """
+    Test turning a QueryValue back to a string usable in a query string
+    """
+
+    search_value = SearchValue(value)
+    actual = search_value.to_query_string()
+
+    assert actual == expected_query_string
+
+
+@pytest.mark.parametrize(
+    ["value", "expected_kind", "expected_value"],
+    [
+        (1, "other", 1),
+        ("1", "other", "1"),
+        ("*", "suffix", ""),  # consider special casing this
+        ("*foo", "suffix", "foo"),
+        ("foo*", "prefix", "foo"),
+        ("*foo*", "infix", "foo"),
+        (r"\*foo", "other", r"*foo"),
+        (r"\\*foo", "other", r"^\\.*foo$"),
+        (r"foo\*", "other", r"foo*"),
+        (r"foo\\*", "prefix", r"foo\\"),
+        ("*f*o*o*", "other", "^.*f.*o.*o.*$"),
+        (r"*foo\*", "suffix", r"foo*"),
+        (r"*foo\\*", "infix", r"foo\\"),
+    ],
+)
+def test_search_value_classify_and_format_wildcard(value, expected_kind, expected_value):
+    """
+    Test classifying the wildcard type into one of prefix/suffix/infix/other
+    and formatting the value according to the classification results.
+    """
+    search_value = SearchValue(value)
+    kind = search_value.classify_wildcard()
+    assert kind == expected_kind
+    assert search_value.format_wildcard(kind) == expected_value

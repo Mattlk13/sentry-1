@@ -1,15 +1,13 @@
-from __future__ import absolute_import
+__all__ = ("Stacktrace",)
 
-__all__ = ('Stacktrace', )
+import math
 
-import six
-
-from django.conf import settings
-from django.utils.translation import ugettext as _
+from django.utils.translation import gettext as _
 
 from sentry.app import env
-from sentry.interfaces.base import Interface, prune_empty_keys
-from sentry.models import UserOption
+from sentry.interfaces.base import DataPath, Interface
+from sentry.users.services.user_option import get_option_from_list, user_option_service
+from sentry.utils.json import prune_empty_keys
 from sentry.web.helpers import render_to_string
 
 
@@ -17,7 +15,7 @@ def max_addr(cur, addr):
     if addr is None:
         return cur
     length = len(addr) - 2
-    if length > cur:
+    if cur is None or length > cur:
         return length
     return cur
 
@@ -25,31 +23,31 @@ def max_addr(cur, addr):
 def pad_hex_addr(addr, length):
     if length is None or addr is None:
         return addr
-    return '0x' + addr[2:].rjust(length, '0')
+    return "0x" + addr[2:].rjust(length, "0")
 
 
 def trim_package(pkg):
     if not pkg:
-        return '?'
-    pkg = pkg.split('/')[-1]
-    if pkg.endswith(('.dylib', '.so', '.a')):
-        pkg = pkg.rsplit('.', 1)[0]
+        return "?"
+    pkg = pkg.split("/")[-1]
+    if pkg.endswith((".dylib", ".so", ".a")):
+        pkg = pkg.rsplit(".", 1)[0]
     return pkg
 
 
 def to_hex_addr(addr):
     if addr is None:
         return None
-    elif isinstance(addr, six.integer_types):
-        rv = '0x%x' % addr
-    elif isinstance(addr, six.string_types):
-        if addr[:2] == '0x':
+    elif isinstance(addr, int):
+        rv = "0x%x" % addr
+    elif isinstance(addr, str):
+        if addr[:2] == "0x":
             addr = int(addr[2:], 16)
-        rv = '0x%x' % int(addr)
+        rv = "0x%x" % int(addr)
     else:
-        raise ValueError('Unsupported address format %r' % (addr, ))
+        raise ValueError(f"Unsupported address format {addr!r}")
     if len(rv) > 24:
-        raise ValueError('Address too long %r' % (rv, ))
+        raise ValueError(f"Address too long {rv!r}")
     return rv
 
 
@@ -88,73 +86,23 @@ def get_context(lineno, context_line, pre_context=None, post_context=None):
 
 
 def is_newest_frame_first(event):
-    newest_first = event.platform not in ('python', None)
+    newest_first = event.platform not in ("python", None)
 
-    if env.request and env.request.user.is_authenticated():
-        display = UserOption.objects.get_value(
-            user=env.request.user,
-            key='stacktrace_order',
-            default=None,
+    if env.request and env.request.user.is_authenticated:
+        options = user_option_service.get_many(
+            filter=dict(user_ids=[env.request.user.id], keys=["stacktrace_order"])
         )
-        if display == '1':
+        display = get_option_from_list(options, default=None)
+        if display == "1":
             newest_first = False
-        elif display == '2':
+        elif display == "2":
             newest_first = True
 
     return newest_first
 
 
 def is_url(filename):
-    return filename.startswith(('file:', 'http:', 'https:', 'applewebdata:'))
-
-
-def slim_frame_data(frames, frame_allowance=settings.SENTRY_MAX_STACKTRACE_FRAMES):
-    """
-    Removes various excess metadata from middle frames which go beyond
-    ``frame_allowance``.
-    """
-    frames_len = 0
-    app_frames = []
-    system_frames = []
-    for frame in frames:
-        frames_len += 1
-        if frame is not None and frame.in_app:
-            app_frames.append(frame)
-        else:
-            system_frames.append(frame)
-
-    if frames_len <= frame_allowance:
-        return
-
-    remaining = frames_len - frame_allowance
-    app_count = len(app_frames)
-    system_allowance = max(frame_allowance - app_count, 0)
-    if system_allowance:
-        half_max = system_allowance / 2
-        # prioritize trimming system frames
-        for frame in system_frames[half_max:-half_max]:
-            frame.vars = None
-            frame.pre_context = None
-            frame.post_context = None
-            remaining -= 1
-
-    else:
-        for frame in system_frames:
-            frame.vars = None
-            frame.pre_context = None
-            frame.post_context = None
-            remaining -= 1
-
-    if not remaining:
-        return
-
-    app_allowance = app_count - remaining
-    half_max = app_allowance / 2
-
-    for frame in app_frames[half_max:-half_max]:
-        frame.vars = None
-        frame.pre_context = None
-        frame.post_context = None
+    return filename.startswith(("file:", "http:", "https:", "applewebdata:"))
 
 
 def validate_bool(value, required=True):
@@ -168,114 +116,140 @@ def validate_bool(value, required=True):
 def handle_nan(value):
     "Remove nan values that can't be json encoded"
     if isinstance(value, float):
-        if value == float('inf'):
-            return '<inf>'
-        if value == float('-inf'):
-            return '<-inf>'
-        # lol checking for float('nan')
-        if value != value:
-            return '<nan>'
+        if value == float("inf"):
+            return "<inf>"
+        if value == float("-inf"):
+            return "<-inf>"
+        if math.isnan(value):
+            return "<nan>"
     return value
 
 
 class Frame(Interface):
-    grouping_variants = ['system', 'app']
+    grouping_variants = ["system", "app"]
 
     @classmethod
-    def to_python(cls, data, raw=False):
+    def to_python(cls, data, **kwargs):
         for key in (
-            'abs_path',
-            'colno',
-            'context_line',
-            'data',
-            'errors',
-            'filename',
-            'function',
-            'raw_function',
-            'image_addr',
-            'in_app',
-            'instruction_addr',
-            'lineno',
-            'module',
-            'package',
-            'platform',
-            'post_context',
-            'pre_context',
-            'symbol',
-            'symbol_addr',
-            'trust',
-            'vars',
+            "abs_path",
+            "colno",
+            "context_line",
+            "data",
+            "errors",
+            "filename",
+            "function",
+            "raw_function",
+            "image_addr",
+            "in_app",
+            "instruction_addr",
+            "addr_mode",
+            "lineno",
+            "module",
+            "package",
+            "platform",
+            "post_context",
+            "pre_context",
+            "source_link",
+            "symbol",
+            "symbol_addr",
+            "trust",
+            "vars",
+            "lock",
         ):
             data.setdefault(key, None)
-        return cls(**data)
+
+        return super().to_python(data, **kwargs)
 
     def to_json(self):
-        return prune_empty_keys({
-            'abs_path': self.abs_path or None,
-            'filename': self.filename or None,
-            'platform': self.platform or None,
-            'module': self.module or None,
-            'function': self.function or None,
-            'raw_function': self.raw_function or None,
-            'package': self.package or None,
-            'image_addr': self.image_addr,
-            'symbol': self.symbol,
-            'symbol_addr': self.symbol_addr,
-            'instruction_addr': self.instruction_addr,
-            'trust': self.trust,
-            'in_app': self.in_app,
-            'context_line': self.context_line,
-            'pre_context': self.pre_context or None,
-            'post_context': self.post_context or None,
-            'vars': self.vars or None,
-            'data': self.data or None,
-            'errors': self.errors or None,
-            'lineno': self.lineno,
-            'colno': self.colno
-        })
+        return prune_empty_keys(
+            {
+                "abs_path": self.abs_path or None,
+                "filename": self.filename or None,
+                "platform": self.platform or None,
+                "module": self.module or None,
+                "function": self.function or None,
+                "raw_function": self.raw_function or None,
+                "package": self.package or None,
+                "image_addr": self.image_addr,
+                "symbol": self.symbol,
+                "symbol_addr": self.symbol_addr,
+                "instruction_addr": self.instruction_addr,
+                "addr_mode": self.addr_mode,
+                "trust": self.trust,
+                "in_app": self.in_app,
+                "context_line": self.context_line,
+                "pre_context": self.pre_context or None,
+                "post_context": self.post_context or None,
+                "vars": self.vars or None,
+                "data": self.data or None,
+                "errors": self.errors or None,
+                "lineno": self.lineno,
+                "colno": self.colno,
+                "lock": self.lock,
+                "source_link": self.source_link or None,
+            }
+        )
 
-    def get_api_context(self, is_public=False, pad_addr=None, platform=None):
-        from sentry.stacktraces.functions import get_function_name_for_frame
+    def get_api_context(self, is_public=False, platform=None, pad_addr=None):
+        from sentry.stacktraces.functions import (
+            get_function_name_for_frame,
+            get_source_link_for_frame,
+        )
+
         function = get_function_name_for_frame(self, platform)
+        source_link = get_source_link_for_frame(self)
         data = {
-            'filename': self.filename,
-            'absPath': self.abs_path,
-            'module': self.module,
-            'package': self.package,
-            'platform': self.platform,
-            'instructionAddr': pad_hex_addr(self.instruction_addr, pad_addr),
-            'symbolAddr': pad_hex_addr(self.symbol_addr, pad_addr),
-            'function': function,
-            'rawFunction': self.raw_function,
-            'symbol': self.symbol,
-            'context': get_context(
+            "filename": self.filename,
+            "absPath": self.abs_path,
+            "module": self.module,
+            "package": self.package,
+            "platform": self.platform,
+            "instructionAddr": pad_hex_addr(self.instruction_addr, pad_addr),
+            "symbolAddr": pad_hex_addr(self.symbol_addr, pad_addr),
+            "function": function,
+            "rawFunction": self.raw_function,
+            "symbol": self.symbol,
+            "context": get_context(
                 lineno=self.lineno,
                 context_line=self.context_line,
                 pre_context=self.pre_context,
                 post_context=self.post_context,
             ),
-            'lineNo': self.lineno,
-            'colNo': self.colno,
-            'inApp': self.in_app,
-            'trust': self.trust,
-            'errors': self.errors,
+            "lineNo": self.lineno,
+            "colNo": self.colno,
+            "inApp": self.in_app,
+            "trust": self.trust,
+            "errors": self.errors,
+            "lock": self.lock,
+            "sourceLink": source_link,
         }
+
         if not is_public:
-            data['vars'] = self.vars
+            data["vars"] = self.vars
+
+        if self.addr_mode and self.addr_mode != "abs":
+            data["addrMode"] = self.addr_mode
+
         # TODO(dcramer): abstract out this API
-        if self.data and 'sourcemap' in data:
+        if self.data and "sourcemap" in self.data:
             data.update(
                 {
-                    'map': self.data['sourcemap'].rsplit('/', 1)[-1],
-                    'origFunction': self.data.get('orig_function', '?'),
-                    'origAbsPath': self.data.get('orig_abs_path', '?'),
-                    'origFilename': self.data.get('orig_filename', '?'),
-                    'origLineNo': self.data.get('orig_lineno', '?'),
-                    'origColNo': self.data.get('orig_colno', '?'),
+                    "map": self.data["sourcemap"].rsplit("/", 1)[-1],
+                    "origFunction": self.data.get("orig_function", "?"),
+                    "origAbsPath": self.data.get("orig_abs_path", "?"),
+                    "origFilename": self.data.get("orig_filename", "?"),
+                    "origLineNo": self.data.get("orig_lineno", "?"),
+                    "origColNo": self.data.get("orig_colno", "?"),
                 }
             )
-            if is_url(self.data['sourcemap']):
-                data['mapUrl'] = self.data['sourcemap']
+            if is_url(self.data["sourcemap"]):
+                data["mapUrl"] = self.data["sourcemap"]
+        if self.data:
+            if "symbolicator_status" in self.data:
+                data["symbolicatorStatus"] = self.data["symbolicator_status"]
+
+            if "min_grouping_level" in self.data:
+                data["minGroupingLevel"] = self.data["min_grouping_level"]
 
         return data
 
@@ -284,26 +258,28 @@ class Frame(Interface):
             return
 
         return {
-            'filename': meta.get('filename'),
-            'absPath': meta.get('abs_path'),
-            'module': meta.get('module'),
-            'package': meta.get('package'),
-            'platform': meta.get('platform'),
-            'instructionAddr': meta.get('instruction_addr'),
-            'symbolAddr': meta.get('symbol_addr'),
-            'function': meta.get('function'),
-            'symbol': meta.get('symbol'),
-            'context': get_context(
-                lineno=meta.get('lineno'),
-                context_line=meta.get('context_line'),
-                pre_context=meta.get('pre_context'),
-                post_context=meta.get('post_context'),
+            "filename": meta.get("filename"),
+            "absPath": meta.get("abs_path"),
+            "module": meta.get("module"),
+            "package": meta.get("package"),
+            "platform": meta.get("platform"),
+            "instructionAddr": meta.get("instruction_addr"),
+            "symbolAddr": meta.get("symbol_addr"),
+            "function": meta.get("function"),
+            "symbol": meta.get("symbol"),
+            "context": get_context(
+                lineno=meta.get("lineno"),
+                context_line=meta.get("context_line"),
+                pre_context=meta.get("pre_context"),
+                post_context=meta.get("post_context"),
             ),
-            'lineNo': meta.get('lineno'),
-            'colNo': meta.get('colno'),
-            'inApp': meta.get('in_app'),
-            'trust': meta.get('trust'),
-            'errors': meta.get('errors'),
+            "lineNo": meta.get("lineno"),
+            "colNo": meta.get("colno"),
+            "inApp": meta.get("in_app"),
+            "trust": meta.get("trust"),
+            "errors": meta.get("errors"),
+            "lock": meta.get("lock"),
+            "sourceLink": meta.get("source_link"),
         }
 
     def is_url(self):
@@ -312,23 +288,27 @@ class Frame(Interface):
         # URLs can be generated such that they are:
         #   blob:http://example.com/7f7aaadf-a006-4217-9ed5-5fbf8585c6c0
         # https://developer.mozilla.org/en-US/docs/Web/API/URL/createObjectURL
-        if self.abs_path.startswith('blob:'):
+        if self.abs_path.startswith("blob:"):
             return True
         return is_url(self.abs_path)
 
     def is_caused_by(self):
-        # XXX(dcramer): dont compute hash using frames containing the 'Caused by'
+        # XXX(dcramer): don't compute hash using frames containing the 'Caused by'
         # text as it contains an exception value which may may contain dynamic
         # values (see raven-java#125)
-        return self.filename.startswith('Caused by: ')
+        return self.filename.startswith("Caused by: ")
 
     def is_unhashable_module(self, platform):
         # Fix for the case where module is a partial copy of the URL
         # and should not be hashed
-        if (platform == 'javascript' and '/' in self.module
-                and self.abs_path and self.abs_path.endswith(self.module)):
+        if (
+            platform == "javascript"
+            and "/" in self.module
+            and self.abs_path
+            and self.abs_path.endswith(self.module)
+        ):
             return True
-        elif platform == 'java' and '$$Lambda$' in self.module:
+        elif platform == "java" and "$$Lambda$" in self.module:
             return True
         return False
 
@@ -336,26 +316,27 @@ class Frame(Interface):
         # TODO(dcramer): lambda$ is Java specific
         # TODO(dcramer): [Anonymous is PHP specific (used for things like SQL
         # queries and JSON data)
-        return self.function.startswith(('lambda$', '[Anonymous'))
+        return self.function.startswith(("lambda$", "[Anonymous"))
 
-    def to_string(self, event):
+    def to_string(self, event) -> str:
         if event.platform is not None:
             choices = [event.platform]
         else:
             choices = []
-        choices.append('default')
-        templates = ['sentry/partial/frames/%s.txt' % choice for choice in choices]
+        choices.append("default")
+        templates = ["sentry/partial/frames/%s.txt" % choice for choice in choices]
         return render_to_string(
-            templates, {
-                'abs_path': self.abs_path,
-                'filename': self.filename,
-                'function': self.function,
-                'module': self.module,
-                'lineno': self.lineno,
-                'colno': self.colno,
-                'context_line': self.context_line,
-            }
-        ).strip('\n')
+            templates,
+            {
+                "abs_path": self.abs_path,
+                "filename": self.filename,
+                "function": self.function,
+                "module": self.module,
+                "lineno": self.lineno,
+                "colno": self.colno,
+                "context_line": self.context_line,
+            },
+        ).strip("\n")
 
 
 class Stacktrace(Interface):
@@ -411,7 +392,7 @@ class Stacktrace(Interface):
       code in this stacktrace. For example, the frames that might power the
       framework's webserver of your app are probably not relevant, however calls
       to the framework's library once you start handling code likely are. See
-      notes below on implicity ``in_app`` behavior.
+      notes below on implicit ``in_app`` behavior.
     ``vars``
       A mapping of variables which were available within this frame (usually context-locals).
     ``package``
@@ -442,7 +423,7 @@ class Stacktrace(Interface):
     >>>     "frames_omitted": [13, 56]
     >>> }
 
-    Implicity ``in_app`` behavior exists when the value is not specified on all
+    Implicit ``in_app`` behavior exists when the value is not specified on all
     frames within a stacktrace (or collectively within an exception if this is
     part of a chain).
 
@@ -457,24 +438,28 @@ class Stacktrace(Interface):
     .. note:: This interface can be passed as the 'stacktrace' key in addition
               to the full interface path.
     """
+
     score = 1950
-    grouping_variants = ['system', 'app']
+    grouping_variants = ["system", "app"]
 
     def __iter__(self):
         return iter(self.frames)
 
     @classmethod
-    def to_python(cls, data, slim_frames=True, raw=False):
+    def to_python(cls, data, datapath: DataPath | None = None, **kwargs):
         data = dict(data)
         frame_list = []
-        for f in data.get('frames') or []:
+        for i, f in enumerate(data.get("frames") or []):
             # XXX(dcramer): handle PHP sending an empty array for a frame
-            frame_list.append(Frame.to_python(f or {}, raw=raw))
+            frame_list.append(
+                Frame.to_python(f or {}, datapath=datapath + ["frames", i] if datapath else None)
+            )
 
-        data['frames'] = frame_list
-        data.setdefault('registers', None)
-        data.setdefault('frames_omitted', None)
-        return cls(**data)
+        data["frames"] = frame_list
+        data.setdefault("registers", None)
+        data.setdefault("frames_omitted", None)
+
+        return super().to_python(data, datapath=datapath, **kwargs)
 
     def get_has_system_frames(self):
         # This is a simplified logic from how the normalizer works.
@@ -495,15 +480,15 @@ class Stacktrace(Interface):
         longest_addr = self.get_longest_address()
 
         frame_list = [
-            f.get_api_context(is_public=is_public, pad_addr=longest_addr,
-                              platform=platform) for f in self.frames
+            f.get_api_context(is_public=is_public, pad_addr=longest_addr, platform=platform)
+            for f in self.frames
         ]
 
         return {
-            'frames': frame_list,
-            'framesOmitted': self.frames_omitted,
-            'registers': self.registers,
-            'hasSystemFrames': self.get_has_system_frames(),
+            "frames": frame_list,
+            "framesOmitted": self.frames_omitted,
+            "registers": self.registers,
+            "hasSystemFrames": self.get_has_system_frames(),
         }
 
     def get_api_meta(self, meta, is_public=False, platform=None):
@@ -511,28 +496,29 @@ class Stacktrace(Interface):
             return meta
 
         frame_meta = {}
-        for index, value in six.iteritems(meta.get('frames', {})):
-            if index == '':
+        for index, value in meta.get("frames", {}).items():
+            if index == "":
                 continue
             frame = self.frames[int(index)]
-            frame_meta[index] = frame.get_api_meta(value, is_public=is_public,
-                                                   platform=platform)
+            frame_meta[index] = frame.get_api_meta(value, is_public=is_public, platform=platform)
 
         return {
-            '': meta.get(''),
-            'frames': frame_meta,
-            'framesOmitted': meta.get('frames_omitted'),
-            'registers': meta.get('registers'),
+            "": meta.get(""),
+            "frames": frame_meta,
+            "framesOmitted": meta.get("frames_omitted"),
+            "registers": meta.get("registers"),
         }
 
     def to_json(self):
-        return prune_empty_keys({
-            'frames': [f and f.to_json() for f in self.frames] or None,
-            'frames_omitted': self.frames_omitted,
-            'registers': self.registers,
-        })
+        return prune_empty_keys(
+            {
+                "frames": [f and f.to_json() for f in self.frames] or None,
+                "frames_omitted": self.frames_omitted,
+                "registers": self.registers,
+            }
+        )
 
-    def to_string(self, event, is_public=False, **kwargs):
+    def to_string(self, event) -> str:
         return self.get_stacktrace(event, system_frames=False, max_frames=10)
 
     def get_stacktrace(
@@ -544,11 +530,11 @@ class Stacktrace(Interface):
         result = []
         if header:
             if newest_first:
-                result.append(_('Stacktrace (most recent call first):'))
+                result.append(_("Stacktrace (most recent call first):"))
             else:
-                result.append(_('Stacktrace (most recent call last):'))
+                result.append(_("Stacktrace (most recent call last):"))
 
-            result.append('')
+            result.append("")
 
         frames = self.frames
 
@@ -576,8 +562,8 @@ class Stacktrace(Interface):
         if not newest_first and visible_frames < num_frames:
             result.extend(
                 (
-                    '(%d additional frame(s) were not displayed)' % (num_frames - visible_frames, ),
-                    '...'
+                    "(%d additional frame(s) were not displayed)" % (num_frames - visible_frames,),
+                    "...",
                 )
             )
 
@@ -587,9 +573,9 @@ class Stacktrace(Interface):
         if newest_first and visible_frames < num_frames:
             result.extend(
                 (
-                    '...',
-                    '(%d additional frame(s) were not displayed)' % (num_frames - visible_frames, )
+                    "...",
+                    "(%d additional frame(s) were not displayed)" % (num_frames - visible_frames,),
                 )
             )
 
-        return '\n'.join(result)
+        return "\n".join(result)

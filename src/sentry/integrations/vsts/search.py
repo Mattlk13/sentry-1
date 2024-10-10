@@ -1,40 +1,37 @@
-from __future__ import absolute_import
+from typing import TypeVar
 
-from sentry.api.bases.integration import IntegrationEndpoint
 from rest_framework.response import Response
 
-from sentry.models import Integration
+from sentry.api.base import control_silo_endpoint
+from sentry.integrations.source_code_management.issues import SourceCodeIssueIntegration
+from sentry.integrations.source_code_management.search import SourceCodeSearchEndpoint
+from sentry.integrations.vsts.integration import VstsIntegration
+
+T = TypeVar("T", bound=SourceCodeIssueIntegration)
 
 
-class VstsSearchEndpoint(IntegrationEndpoint):
+@control_silo_endpoint
+class VstsSearchEndpoint(SourceCodeSearchEndpoint):
+    @property
+    def integration_provider(self):
+        return "vsts"
 
-    def get(self, request, organization, integration_id):
-        try:
-            integration = Integration.objects.get(
-                organizations=organization,
-                id=integration_id,
-                provider='vsts',
-            )
-        except Integration.DoesNotExist:
-            return Response(status=404)
+    @property
+    def installation_class(self):
+        return VstsIntegration
 
-        field = request.GET.get('field')
-        query = request.GET.get('query')
-        if field is None:
-            return Response({'detail': 'field is a required parameter'}, status=400)
+    def handle_search_issues(self, installation: T, query: str, repo: str | None) -> Response:
         if not query:
-            return Response({'detail': 'query is a required parameter'}, status=400)
+            return Response([])
 
-        installation = integration.get_installation(organization.id)
-
-        if field == 'externalIssue':
-            if not query:
-                return Response([])
-
-            resp = installation.get_client().search_issues(integration.name, query)
-            return Response([{
-                'label': '(%s) %s' % (i['fields']['system.id'], i['fields']['system.title']),
-                'value': i['fields']['system.id'],
-            } for i in resp.get('results', [])])
-
-        return Response(status=400)
+        assert isinstance(installation, self.installation_class)
+        resp = installation.search_issues(query=query)
+        return Response(
+            [
+                {
+                    "label": f'({i["fields"]["system.id"]}) {i["fields"]["system.title"]}',
+                    "value": i["fields"]["system.id"],
+                }
+                for i in resp.get("results", [])
+            ]
+        )

@@ -1,2 +1,8 @@
-node_modules/
-build/
+/.devenv
+/.dockerignore
+/.git
+/.gitignore
+/.venv
+/fixtures
+/node_modules
+/tests

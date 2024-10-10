@@ -1,69 +1,69 @@
-from __future__ import absolute_import
+from rest_framework.request import Request
+from rest_framework.response import Response
 
-from sentry import tagstore
-from sentry.api.base import DocSection, EnvironmentMixin
+from sentry import analytics, tagstore
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import EnvironmentMixin, region_silo_endpoint
 from sentry.api.bases.group import GroupEndpoint
 from sentry.api.exceptions import ResourceDoesNotExist
+from sentry.api.helpers.environments import get_environments
 from sentry.api.serializers import serialize
 from sentry.api.serializers.models.tagvalue import UserTagValueSerializer
-from sentry.models import Group, Environment
-from sentry.utils.apidocs import scenario
 
 
-@scenario('ListTagValues')
-def list_tag_values_scenario(runner):
-    group = Group.objects.filter(project=runner.default_project).first()
-    runner.request(
-        method='GET',
-        path='/issues/%s/tags/%s/values/' % (group.id, 'browser'),
-    )
-
-
+@region_silo_endpoint
 class GroupTagKeyValuesEndpoint(GroupEndpoint, EnvironmentMixin):
-    doc_section = DocSection.EVENTS
+    publish_status = {
+        "GET": ApiPublishStatus.UNKNOWN,
+    }
 
-    # XXX: this scenario does not work for some inexplicable reasons
-    # @attach_scenarios([list_tag_values_scenario])
-    def get(self, request, group, key):
+    def get(self, request: Request, group, key) -> Response:
         """
         List a Tag's Values
         ```````````````````
 
         Return a list of values associated with this key for an issue.
+        When paginated can return at most 1000 values.
 
         :pparam string issue_id: the ID of the issue to retrieve.
         :pparam string key: the tag key to look the values up for.
         :auth: required
         """
-        lookup_key = tagstore.prefix_reserved_key(key)
+        analytics.record(
+            "eventuser_endpoint.request",
+            project_id=group.project_id,
+            endpoint="sentry.api.endpoints.group_tagkey_values.get",
+        )
+        lookup_key = tagstore.backend.prefix_reserved_key(key)
 
+        environment_ids = [e.id for e in get_environments(request, group.project.organization)]
+        tenant_ids = {"organization_id": group.project.organization_id}
         try:
-            environment_id = self._get_environment_id_from_request(
-                request, group.project.organization_id)
-        except Environment.DoesNotExist:
-            # if the environment doesn't exist then the tag can't possibly exist
+            tagstore.backend.get_group_tag_key(
+                group,
+                None,
+                lookup_key,
+                tenant_ids=tenant_ids,
+            )
+        except tagstore.GroupTagKeyNotFound:
             raise ResourceDoesNotExist
-
-        try:
-            tagstore.get_tag_key(group.project_id, environment_id, lookup_key)
-        except tagstore.TagKeyNotFound:
-            raise ResourceDoesNotExist
-
-        sort = request.GET.get('sort')
-        if sort == 'date':
-            order_by = '-last_seen'
-        elif sort == 'age':
-            order_by = '-first_seen'
+        sort = request.GET.get("sort")
+        if sort == "date":
+            order_by = "-last_seen"
+        elif sort == "age":
+            order_by = "-first_seen"
+        elif sort == "count":
+            order_by = "-times_seen"
         else:
-            order_by = '-id'
+            order_by = "-id"
 
-        if key == 'user':
+        if key == "user":
             serializer_cls = UserTagValueSerializer(group.project_id)
         else:
             serializer_cls = None
 
-        paginator = tagstore.get_group_tag_value_paginator(
-            group.project_id, group.id, environment_id, lookup_key, order_by=order_by
+        paginator = tagstore.backend.get_group_tag_value_paginator(
+            group, environment_ids, lookup_key, order_by=order_by, tenant_ids=tenant_ids
         )
 
         return self.paginate(

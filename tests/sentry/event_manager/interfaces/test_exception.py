@@ -1,13 +1,9 @@
-# -*- coding: utf-8 -*-
-
-from __future__ import absolute_import
-
 import pytest
 
-from sentry.interfaces.exception import Exception, slim_exception_data
-from sentry.stacktraces.processing import normalize_stacktraces_for_grouping
-from sentry.models import Event
+from sentry import eventstore
 from sentry.event_manager import EventManager
+from sentry.interfaces.exception import Exception
+from sentry.stacktraces.processing import normalize_stacktraces_for_grouping
 
 
 @pytest.fixture
@@ -15,16 +11,22 @@ def make_exception_snapshot(insta_snapshot):
     def inner(data):
         mgr = EventManager(data={"exception": data})
         mgr.normalize()
-        evt = Event(data=mgr.get_data())
+        evt = eventstore.backend.create_event(data=mgr.get_data())
 
-        interface = evt.interfaces.get('exception')
+        interface = evt.interfaces.get("exception")
 
-        insta_snapshot({
-            'errors': evt.data.get('errors'),
-            'to_json': interface and interface.to_json(),
-            'get_api_context': interface and interface.get_api_context(),
-            'to_string': interface and interface.to_string(evt),
-        })
+        snapshot_values = {
+            "errors": evt.data.get("errors"),
+            "to_json": interface and interface.to_json(),
+            "get_api_context": interface and interface.get_api_context(),
+            "to_string": interface and interface.to_string(evt),
+        }
+
+        tags = sorted(interface.iter_tags())
+        if len(tags) > 0:
+            snapshot_values["tags"] = tags
+
+        insta_snapshot(snapshot_values)
 
     return inner
 
@@ -34,28 +36,21 @@ def test_basic(make_exception_snapshot):
         dict(
             values=[
                 {
-                    'type': 'ValueError',
-                    'value': 'hello world',
-                    'module': 'foo.bar',
-                    'stacktrace': {
-                        'frames': [{
-                            'filename': 'foo/baz.py',
-                            'lineno': 1,
-                            'in_app': True,
-                        }]
+                    "type": "ValueError",
+                    "value": "hello world",
+                    "module": "foo.bar",
+                    "stacktrace": {
+                        "frames": [{"filename": "foo/baz.py", "lineno": 1, "in_app": True}]
                     },
-                }, {
-                    'type': 'ValueError',
-                    'value': 'hello world',
-                    'module': 'foo.bar',
-                    'stacktrace': {
-                        'frames': [{
-                            'filename': 'foo/baz.py',
-                            'lineno': 1,
-                            'in_app': True,
-                        }]
+                },
+                {
+                    "type": "ValueError",
+                    "value": "hello world",
+                    "module": "foo.bar",
+                    "stacktrace": {
+                        "frames": [{"filename": "foo/baz.py", "lineno": 1, "in_app": True}]
                     },
-                }
+                },
             ]
         )
     )
@@ -63,30 +58,16 @@ def test_basic(make_exception_snapshot):
 
 def test_args_as_keyword_args(make_exception_snapshot):
     make_exception_snapshot(
-        dict(values=[{
-            'type': 'ValueError',
-            'value': 'hello world',
-            'module': 'foo.bar',
-        }])
+        dict(values=[{"type": "ValueError", "value": "hello world", "module": "foo.bar"}])
     )
 
 
 def test_args_as_old_style(make_exception_snapshot):
-    make_exception_snapshot(
-        {
-            'type': 'ValueError',
-            'value': 'hello world',
-            'module': 'foo.bar',
-        }
-    )
+    make_exception_snapshot({"type": "ValueError", "value": "hello world", "module": "foo.bar"})
 
 
 def test_non_string_value_with_no_type(make_exception_snapshot):
-    make_exception_snapshot(
-        {
-            'value': {'foo': 'bar'},
-        }
-    )
+    make_exception_snapshot({"value": {"foo": "bar"}})
 
 
 def test_context_with_mixed_frames(make_exception_snapshot):
@@ -94,28 +75,21 @@ def test_context_with_mixed_frames(make_exception_snapshot):
         dict(
             values=[
                 {
-                    'type': 'ValueError',
-                    'value': 'hello world',
-                    'module': 'foo.bar',
-                    'stacktrace': {
-                        'frames': [{
-                            'filename': 'foo/baz.py',
-                            'lineno': 1,
-                            'in_app': True,
-                        }]
+                    "type": "ValueError",
+                    "value": "hello world",
+                    "module": "foo.bar",
+                    "stacktrace": {
+                        "frames": [{"filename": "foo/baz.py", "lineno": 1, "in_app": True}]
                     },
-                }, {
-                    'type': 'ValueError',
-                    'value': 'hello world',
-                    'module': 'foo.bar',
-                    'stacktrace': {
-                        'frames': [{
-                            'filename': 'foo/baz.py',
-                            'lineno': 1,
-                            'in_app': False,
-                        }]
+                },
+                {
+                    "type": "ValueError",
+                    "value": "hello world",
+                    "module": "foo.bar",
+                    "stacktrace": {
+                        "frames": [{"filename": "foo/baz.py", "lineno": 1, "in_app": False}]
                     },
-                }
+                },
             ]
         )
     )
@@ -126,17 +100,17 @@ def test_context_with_symbols(make_exception_snapshot):
         dict(
             values=[
                 {
-                    'type': 'ValueError',
-                    'value': 'hello world',
-                    'module': 'foo.bar',
-                    'stacktrace': {
-                        'frames': [
+                    "type": "ValueError",
+                    "value": "hello world",
+                    "module": "foo.bar",
+                    "stacktrace": {
+                        "frames": [
                             {
-                                'filename': 'foo/baz.py',
-                                'function': 'myfunc',
-                                'symbol': 'Class.myfunc',
-                                'lineno': 1,
-                                'in_app': True,
+                                "filename": "foo/baz.py",
+                                "function": "myfunc",
+                                "symbol": "Class.myfunc",
+                                "lineno": 1,
+                                "in_app": True,
                             }
                         ]
                     },
@@ -151,28 +125,21 @@ def test_context_with_only_system_frames(make_exception_snapshot):
         dict(
             values=[
                 {
-                    'type': 'ValueError',
-                    'value': 'hello world',
-                    'module': 'foo.bar',
-                    'stacktrace': {
-                        'frames': [{
-                            'filename': 'foo/baz.py',
-                            'lineno': 1,
-                            'in_app': False,
-                        }]
+                    "type": "ValueError",
+                    "value": "hello world",
+                    "module": "foo.bar",
+                    "stacktrace": {
+                        "frames": [{"filename": "foo/baz.py", "lineno": 1, "in_app": False}]
                     },
-                }, {
-                    'type': 'ValueError',
-                    'value': 'hello world',
-                    'module': 'foo.bar',
-                    'stacktrace': {
-                        'frames': [{
-                            'filename': 'foo/baz.py',
-                            'lineno': 1,
-                            'in_app': False,
-                        }]
+                },
+                {
+                    "type": "ValueError",
+                    "value": "hello world",
+                    "module": "foo.bar",
+                    "stacktrace": {
+                        "frames": [{"filename": "foo/baz.py", "lineno": 1, "in_app": False}]
                     },
-                }
+                },
             ]
         )
     )
@@ -181,31 +148,20 @@ def test_context_with_only_system_frames(make_exception_snapshot):
 def test_context_with_only_app_frames(make_exception_snapshot):
     values = [
         {
-            'type': 'ValueError',
-            'value': 'hello world',
-            'module': 'foo.bar',
-            'stacktrace': {
-                'frames': [{
-                    'filename': 'foo/baz.py',
-                    'lineno': 1,
-                    'in_app': True,
-                }]
-            },
-        }, {
-            'type': 'ValueError',
-            'value': 'hello world',
-            'module': 'foo.bar',
-            'stacktrace': {
-                'frames': [{
-                    'filename': 'foo/baz.py',
-                    'lineno': 1,
-                    'in_app': True,
-                }]
-            },
-        }
+            "type": "ValueError",
+            "value": "hello world",
+            "module": "foo.bar",
+            "stacktrace": {"frames": [{"filename": "foo/baz.py", "lineno": 1, "in_app": True}]},
+        },
+        {
+            "type": "ValueError",
+            "value": "hello world",
+            "module": "foo.bar",
+            "stacktrace": {"frames": [{"filename": "foo/baz.py", "lineno": 1, "in_app": True}]},
+        },
     ]
     exc = dict(values=values)
-    normalize_stacktraces_for_grouping({'exception': exc})
+    normalize_stacktraces_for_grouping({"exception": exc})
     make_exception_snapshot(exc)
 
 
@@ -214,26 +170,26 @@ def test_context_with_raw_stacks(make_exception_snapshot):
         dict(
             values=[
                 {
-                    'type': 'ValueError',
-                    'value': 'hello world',
-                    'module': 'foobar',
-                    'raw_stacktrace': {
-                        'frames': [
+                    "type": "ValueError",
+                    "value": "hello world",
+                    "module": "foobar",
+                    "raw_stacktrace": {
+                        "frames": [
                             {
-                                'filename': None,
-                                'lineno': 1,
-                                'function': '<redacted>',
-                                'in_app': True,
+                                "filename": None,
+                                "lineno": 1,
+                                "function": "<redacted>",
+                                "in_app": True,
                             }
                         ]
                     },
-                    'stacktrace': {
-                        'frames': [
+                    "stacktrace": {
+                        "frames": [
                             {
-                                'filename': 'foo/baz.c',
-                                'lineno': 1,
-                                'function': 'main',
-                                'in_app': True,
+                                "filename": "foo/baz.c",
+                                "lineno": 1,
+                                "function": "main",
+                                "in_app": True,
                             }
                         ]
                     },
@@ -248,72 +204,66 @@ def test_context_with_mechanism(make_exception_snapshot):
         dict(
             values=[
                 {
-                    'type': 'ValueError',
-                    'value': 'hello world',
-                    'module': 'foo.bar',
-                    'stacktrace': {
-                        'frames': [{
-                            'filename': 'foo/baz.py',
-                            'lineno': 1,
-                            'in_app': True,
-                        }]
+                    "type": "ValueError",
+                    "value": "hello world",
+                    "module": "foo.bar",
+                    "stacktrace": {
+                        "frames": [{"filename": "foo/baz.py", "lineno": 1, "in_app": True}]
                     },
-                    'mechanism': {
-                        'type': 'generic',
-                    }
+                    "mechanism": {
+                        "type": "generic",
+                        "source": "__context__",
+                        "exception_id": 0,
+                    },
                 }
             ]
         )
     )
 
 
+def test_context_with_two_exceptions_having_mechanism(make_exception_snapshot):
+    make_exception_snapshot(
+        dict(
+            values=[
+                {
+                    "type": "ValueError",
+                    "value": "hello world",
+                    "module": "foo.bar",
+                    "stacktrace": {
+                        "frames": [{"filename": "foo/baz.py", "lineno": 1, "in_app": True}]
+                    },
+                    "mechanism": {
+                        "type": "chained",
+                        "handled": True,
+                        "source": "__context__",
+                        "exception_id": 1,
+                        "parent_id": 0,
+                    },
+                },
+                {
+                    "type": "ValueError",
+                    "value": "hello world",
+                    "module": "foo.bar",
+                    "stacktrace": {
+                        "frames": [{"filename": "foo/baz.py", "lineno": 1, "in_app": True}]
+                    },
+                    "mechanism": {
+                        "type": "generic",
+                        "handled": False,
+                        "source": "__context__",
+                        "is_exception_group": True,
+                        "exception_id": 0,
+                    },
+                },
+            ]
+        )
+    )
+
+
 def test_iteration():
-    inst = Exception.to_python({
-        'values': [None, {'type': 'ValueError'}, None]
-    })
+    inst = Exception.to_python({"values": [None, {"type": "ValueError"}, None]})
 
     assert len(inst) == 1
-    assert inst[0].type == 'ValueError'
+    assert inst[0].type == "ValueError"
     for exc in inst:
-        assert exc.type == 'ValueError'
-
-
-def test_slim_exception_data_under_max(insta_snapshot):
-    interface = Exception.to_python(
-        {
-            'values': [{
-                'value': 'foo',
-                'stacktrace': {
-                    'frames': [{
-                        'filename': 'foo'
-                    }]
-                },
-            }]
-        }
-    )
-    slim_exception_data(interface)
-    insta_snapshot(interface.to_json())
-
-
-def test_slim_exception_data_over_max(insta_snapshot):
-    values = []
-    for x in range(5):
-        exc = {'value': 'exc %d' % x, 'stacktrace': {'frames': []}}
-        values.append(exc)
-        for y in range(5):
-            exc['stacktrace']['frames'].append(
-                {
-                    'filename': 'exc %d frame %d' % (x, y),
-                    'vars': {
-                        'foo': 'bar'
-                    },
-                    'context_line': 'b',
-                    'pre_context': ['a'],
-                    'post_context': ['c'],
-                }
-            )
-
-    interface = Exception.to_python({'values': values})
-    # slim to 10 frames to make tests easier
-    slim_exception_data(interface, 10)
-    insta_snapshot(interface.to_json())
+        assert exc.type == "ValueError"

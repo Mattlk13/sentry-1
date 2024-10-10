@@ -1,18 +1,23 @@
-from __future__ import absolute_import
+import orjson
+from django.http import HttpRequest, HttpResponse
 
-import six
-
-from django.http import HttpResponse
-
+from sentry import eventstore
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import region_silo_endpoint
 from sentry.api.bases.project import ProjectEndpoint
 from sentry.api.exceptions import ResourceDoesNotExist
-from sentry.grouping.api import GroupingConfigNotFound
-from sentry.models import Event, SnubaEvent
-from sentry.utils import json
+from sentry.grouping.grouping_info import get_grouping_info
 
 
+@region_silo_endpoint
 class EventGroupingInfoEndpoint(ProjectEndpoint):
-    def get(self, request, project, event_id):
+    owner = ApiOwner.ISSUES
+    publish_status = {
+        "GET": ApiPublishStatus.PRIVATE,
+    }
+
+    def get(self, request: HttpRequest, project, event_id) -> HttpResponse:
         """
         Returns the grouping information for an event
         `````````````````````````````````````````````
@@ -20,33 +25,12 @@ class EventGroupingInfoEndpoint(ProjectEndpoint):
         This endpoint returns a JSON dump of the metadata that went into the
         grouping algorithm.
         """
-        event = SnubaEvent.objects.from_event_id(event_id, project_id=project.id)
+        event = eventstore.backend.get_event_by_id(project.id, event_id)
         if event is None:
             raise ResourceDoesNotExist
 
-        Event.objects.bind_nodes([event], 'data')
+        grouping_info = get_grouping_info(request.GET.get("config", None), project, event)
 
-        rv = {}
-        config_name = request.GET.get('config') or None
-
-        # We always fetch the stored hashes here.  The reason for this is
-        # that we want to show in the UI if the forced grouping algorithm
-        # produced hashes that would normally also appear in the event.
-        hashes = event.get_hashes()
-
-        try:
-            variants = event.get_grouping_variants(force_config=config_name,
-                                                   normalize_stacktraces=True)
-        except GroupingConfigNotFound:
-            raise ResourceDoesNotExist(detail='Unknown grouping config')
-
-        for (key, variant) in six.iteritems(variants):
-            d = variant.as_dict()
-            # Since the hashes are generated on the fly and might no
-            # longer match the stored ones we indicate if the hash
-            # generation caused the hash to mismatch.
-            d['hashMismatch'] = d['hash'] is not None and d['hash'] not in hashes
-            d['key'] = key
-            rv[key] = d
-
-        return HttpResponse(json.dumps(rv), content_type='application/json')
+        return HttpResponse(
+            orjson.dumps(grouping_info, option=orjson.OPT_UTC_Z), content_type="application/json"
+        )

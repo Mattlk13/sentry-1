@@ -1,284 +1,1107 @@
-from __future__ import absolute_import
+from unittest import mock
 
-from sentry.models import Dashboard, Widget, WidgetDataSource, WidgetDataSourceTypes, WidgetDisplayTypes
-from sentry.testutils import OrganizationDashboardWidgetTestCase
+from django.urls import reverse
+
+from sentry import options
+from sentry.models.dashboard_widget import (
+    DashboardWidget,
+    DashboardWidgetDisplayTypes,
+    DashboardWidgetQuery,
+    DashboardWidgetQueryOnDemand,
+    DashboardWidgetTypes,
+)
+from sentry.snuba.metrics.extraction import OnDemandMetricSpecVersioning
+from sentry.testutils.cases import OrganizationDashboardWidgetTestCase
+from sentry.testutils.helpers.datetime import before_now
+from sentry.testutils.skips import requires_snuba
+
+pytestmark = [requires_snuba]
+ONDEMAND_FEATURES = [
+    "organizations:on-demand-metrics-extraction",
+    "organizations:on-demand-metrics-extraction-widgets",
+    "organizations:on-demand-metrics-extraction-experimental",
+    "organizations:on-demand-metrics-prefill",
+]
 
 
 class OrganizationDashboardWidgetDetailsTestCase(OrganizationDashboardWidgetTestCase):
-    endpoint = 'sentry-api-0-organization-dashboard-widget-details'
-
-    def setUp(self):
-        super(OrganizationDashboardWidgetDetailsTestCase, self).setUp()
-        self.widget = Widget.objects.create(
-            dashboard_id=self.dashboard.id,
-            order=1,
-            title='Widget 1',
-            display_type=WidgetDisplayTypes.LINE_CHART,
-            display_options={},
+    def url(self):
+        return reverse(
+            "sentry-api-0-organization-dashboard-widget-details",
+            kwargs={"organization_id_or_slug": self.organization.slug},
         )
 
-    def tearDown(self):
-        super(OrganizationDashboardWidgetDetailsTestCase, self).tearDown()
-        Widget.objects.all().delete()
-        WidgetDataSource.objects.all().delete()
+    def test_valid_widget(self):
+        data = {
+            "title": "Errors over time",
+            "displayType": "line",
+            "queries": [
+                {
+                    "name": "errors",
+                    "conditions": "event.type:error",
+                    "fields": ["count()"],
+                    "columns": [],
+                    "aggregates": ["count()"],
+                },
+                {
+                    "name": "errors",
+                    "conditions": "(level:error OR title:*Error*) !release:latest",
+                    "fields": ["count()"],
+                    "columns": [],
+                    "aggregates": ["count()"],
+                    "orderby": "count()",
+                },
+            ],
+            "description": "Valid widget description",
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 200, response.data
 
+    def test_valid_widget_permissions(self):
+        self.create_user_member_role()
+        self.test_valid_widget()
 
-class OrganizationDashboardWidgetDetailsPutTestCase(OrganizationDashboardWidgetDetailsTestCase):
-    method = 'put'
+    def test_invalid_query_conditions(self):
+        data = {
+            "title": "Invalid query",
+            "displayType": "line",
+            "queries": [
+                {
+                    "name": "errors",
+                    "conditions": "event.type: tag:foo",
+                    "fields": ["count()"],
+                    "columns": [],
+                    "aggregates": ["count()"],
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 400, response.data
+        assert "queries" in response.data, response.data
+        assert response.data["queries"][0]["conditions"], response.data
 
-    def test_simple(self):
-        data_sources = [
-            {
-                'name': 'knownUsersAffectedQuery_2',
-                'data': self.known_users_query,
-                'type': 'discover_saved_search',
-                'order': 1,
+    def test_blank_descriptions_are_allowed(self):
+        data = {
+            "title": "Errors over time",
+            "displayType": "line",
+            "queries": [
+                {
+                    "name": "errors",
+                    "conditions": "event.type:error",
+                    "fields": ["count()"],
+                    "columns": [],
+                    "aggregates": ["count()"],
+                },
+                {
+                    "name": "errors",
+                    "conditions": "(level:error OR title:*Error*) !release:latest",
+                    "fields": ["count()"],
+                    "columns": [],
+                    "aggregates": ["count()"],
+                    "orderby": "count()",
+                },
+            ],
+            "description": "Valid widget description",
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 200, response.data
+
+        data["description"] = ""
+
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 200, response.data
+
+    def test_invalid_widget_permissions(self):
+        self.create_user_member_role()
+        self.test_invalid_query_conditions()
+
+    def test_invalid_query_fields(self):
+        data = {
+            "title": "Invalid query",
+            "displayType": "line",
+            "queries": [
+                {
+                    "name": "errors",
+                    "conditions": "event.type:error",
+                    "fields": ["p95(user)"],
+                    "columns": [],
+                    "aggregates": ["p95(user)"],
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 400, response.data
+        assert "queries" in response.data, response.data
+        assert response.data["queries"][0]["fields"], response.data
+
+    def test_invalid_display_type(self):
+        data = {
+            "title": "Invalid query",
+            "displayType": "cats",
+            "queries": [
+                {
+                    "name": "errors",
+                    "conditions": "event.type:error",
+                    "fields": ["count()"],
+                    "columns": [],
+                    "aggregates": ["count()"],
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 400, response.data
+        assert "displayType" in response.data, response.data
+
+    def test_invalid_equation(self):
+        data = {
+            "title": "Invalid query",
+            "displayType": "line",
+            "queries": [
+                {
+                    "name": "errors",
+                    "conditions": "event.type:error",
+                    "fields": ["equation|count()"],
+                    "columns": [],
+                    "aggregates": ["equation|count()"],
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 400, response.data
+        assert "queries" in response.data, response.data
+
+    def test_valid_equation_line_widget(self):
+        data = {
+            "title": "Invalid query",
+            "displayType": "line",
+            "queries": [
+                {
+                    "name": "errors",
+                    "conditions": "event.type:error",
+                    "fields": ["equation|count() * 2"],
+                    "columns": [],
+                    "aggregates": ["equation|count() * 2"],
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 200, response.data
+
+    def test_valid_orderby_equation_alias_line_widget(self):
+        data = {
+            "title": "Invalid query",
+            "displayType": "line",
+            "queries": [
+                {
+                    "name": "errors",
+                    "conditions": "event.type:error",
+                    "fields": ["equation|count() * 2"],
+                    "columns": [],
+                    "aggregates": ["equation|count() * 2"],
+                    "orderby": "equation[0]",
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 200, response.data
+
+    def test_invalid_orderby_equation_alias_line_widget(self):
+        data = {
+            "title": "Invalid query",
+            "displayType": "line",
+            "queries": [
+                {
+                    "name": "errors",
+                    "conditions": "event.type:error",
+                    "fields": ["equation|count() * 2"],
+                    "columns": [],
+                    "aggregates": ["equation|count() * 2"],
+                    "orderby": "equation[999999]",
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 400, response.data
+        assert "queries" in response.data, response.data
+
+    def test_missing_equation_for_orderby_equation_alias(self):
+        data = {
+            "title": "Invalid query",
+            "displayType": "line",
+            "queries": [
+                {
+                    "name": "errors",
+                    "conditions": "event.type:error",
+                    "fields": [""],
+                    "columns": [],
+                    "aggregates": [],
+                    "orderby": "equation[0]",
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 400, response.data
+        assert "queries" in response.data, response.data
+
+    def test_invalid_equation_table_widget(self):
+        data = {
+            "title": "Invalid query",
+            "displayType": "table",
+            "queries": [
+                {
+                    "name": "errors",
+                    "conditions": "event.type:error",
+                    "fields": ["equation|count() * 2"],
+                    "columns": [],
+                    "aggregates": ["equation|count() * 2"],
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 400, response.data
+        assert "queries" in response.data, response.data
+
+    def test_valid_epm_widget(self):
+        data = {
+            "title": "EPM Big Number",
+            "displayType": "big_number",
+            "queries": [
+                {
+                    "name": "",
+                    "fields": ["epm()"],
+                    "columns": [],
+                    "aggregates": ["epm()"],
+                    "conditions": "",
+                    "orderby": "",
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 200, response.data
+
+    def test_big_number_widget_with_selected_equation(self):
+        data = {
+            "title": "EPM Big Number",
+            "displayType": "big_number",
+            "queries": [
+                {
+                    "name": "",
+                    "fields": ["epm()"],
+                    "columns": [],
+                    "aggregates": ["epm()", "count()", "equation|epm()*count()"],
+                    "conditions": "",
+                    "orderby": "",
+                    "selectedAggregate": "1",
+                }
+            ],
+        }
+        with self.feature({"organizations:dashboards-bignumber-equations": True}):
+            response = self.do_request(
+                "post",
+                self.url(),
+                data=data,
+            )
+        assert response.status_code == 200, response.data
+
+    def test_project_search_condition(self):
+        self.user = self.create_user(is_superuser=False)
+        self.project = self.create_project(
+            name="foo", organization=self.organization, teams=[self.team]
+        )
+        self.create_member(
+            user=self.user, organization=self.organization, role="member", teams=[self.team]
+        )
+        self.login_as(self.user)
+        data = {
+            "title": "EPM Big Number",
+            "displayType": "big_number",
+            "queries": [
+                {
+                    "name": "",
+                    "fields": ["epm()"],
+                    "columns": [],
+                    "aggregates": ["epm()"],
+                    "conditions": f"project:{self.project.name}",
+                    "orderby": "",
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 200, response.data
+
+    def test_issue_search_condition(self):
+        self.user = self.create_user(is_superuser=False)
+        self.create_member(
+            user=self.user, organization=self.organization, role="member", teams=[self.team]
+        )
+        self.login_as(self.user)
+
+        event = self.store_event(
+            data={
+                "event_id": "a" * 32,
+                "transaction": "/example",
+                "message": "how to make fast",
+                "timestamp": before_now(minutes=2).timestamp(),
+                "fingerprint": ["group_1"],
             },
-            {
-                'name': 'anonymousUsersAffectedQuery_2',
-                'data': self.anon_users_query,
-                'type': 'discover_saved_search',
-                'order': 2
-            },
+            project_id=self.project.id,
+        )
+        assert event.group is not None
+
+        data = {
+            "title": "EPM Big Number",
+            "displayType": "big_number",
+            "queries": [
+                {
+                    "name": "",
+                    "fields": ["epm()"],
+                    "columns": [],
+                    "aggregates": ["epm()"],
+                    "conditions": f"issue:{event.group.qualified_short_id}",
+                    "orderby": "",
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 200, response.data
+
+    def test_valid_issue_query_conditions(self):
+        data = {
+            "title": "Unresolved Issues",
+            "displayType": "table",
+            "widgetType": "issue",
+            "queries": [
+                {
+                    "name": "unresolved",
+                    "conditions": "is:unresolved",
+                    "fields": [],
+                    "columns": [],
+                    "aggregates": [],
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 200, response.data
+
+    def test_invalid_issue_query_conditions(self):
+        data = {
+            "title": "Unresolved Issues",
+            "displayType": "table",
+            "widgetType": "issue",
+            "queries": [
+                {
+                    "name": "unresolved",
+                    "conditions": "is:())",
+                    "fields": [],
+                    "columns": [],
+                    "aggregates": [],
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 400, response.data
+        assert "queries" in response.data, response.data
+        assert response.data["queries"][0]["conditions"], response.data
+
+    def test_invalid_issue_query_conditions_in_discover_widget(self):
+        data = {
+            "title": "Unresolved Issues",
+            "displayType": "table",
+            "widgetType": "discover",
+            "queries": [
+                {
+                    "name": "unresolved",
+                    "conditions": "is:unresolved",
+                    "fields": [],
+                    "columns": [],
+                    "aggregates": [],
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 400, response.data
+        assert "queries" in response.data, response.data
+        assert response.data["queries"][0]["conditions"], response.data
+
+    def test_timestamp_query_with_timezone(self):
+        data = {
+            "title": "Timestamp filter",
+            "displayType": "table",
+            "widgetType": "discover",
+            "queries": [
+                {
+                    "name": "timestamp filter",
+                    "conditions": f"timestamp.to_day:<{before_now(hours=1)}",
+                    "fields": [],
+                }
+            ],
+            "statsPeriod": "24h",
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 200, response.data
+
+    def test_raw_equation_in_orderby_is_valid(self):
+        data = {
+            "title": "Test Query",
+            "displayType": "table",
+            "widgetType": "discover",
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "",
+                    "fields": [],
+                    "columns": [],
+                    "aggregates": [],
+                    "orderby": "equation|count() * 2",
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 200, response.data
+
+    def test_raw_desc_equation_in_orderby_is_valid(self):
+        data = {
+            "title": "Test Query",
+            "displayType": "table",
+            "widgetType": "discover",
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "",
+                    "fields": [],
+                    "columns": [],
+                    "aggregates": [],
+                    "orderby": "-equation|count() * 2",
+                }
+            ],
+            "statsPeriod": "24h",
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 200, response.data
+
+    def test_invalid_raw_equation_in_orderby_throws_error(self):
+        data = {
+            "title": "Test Query",
+            "displayType": "table",
+            "widgetType": "discover",
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "",
+                    "fields": [],
+                    "columns": [],
+                    "aggregates": [],
+                    "orderby": "-equation|thisIsNotARealEquation() * 42",
+                }
+            ],
+            "statsPeriod": "24h",
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 400, response.data
+        assert "queries" in response.data, response.data
+
+    def test_save_with_orderby_from_columns(self):
+        data = {
+            "title": "Test Query",
+            "displayType": "line",
+            "widgetType": "discover",
+            "limit": 5,
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "",
+                    "fields": ["count()"],
+                    "columns": ["project"],
+                    "aggregates": ["count()"],
+                    "orderby": "-project",
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 200, response.data
+
+    def test_save_with_orderby_not_from_columns_or_aggregates(self):
+        data = {
+            "title": "Test Query",
+            "displayType": "line",
+            "widgetType": "discover",
+            "limit": 5,
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "",
+                    "fields": [],
+                    "columns": ["project"],
+                    "aggregates": ["count()"],
+                    "orderby": "-epm()",
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 200, response.data
+
+    def test_save_with_invalid_orderby_not_from_columns_or_aggregates(self):
+        data = {
+            "title": "Test Query",
+            "displayType": "line",
+            "widgetType": "discover",
+            "limit": 5,
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "",
+                    "fields": [],
+                    "columns": ["project"],
+                    "aggregates": ["count()"],
+                    "orderby": "-eeeeeeeepm()",
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 400, response.data
+        assert "queries" in response.data, response.data
+
+    def test_save_with_total_count(self):
+        # We cannot query the Discover entity without a project being defined for the org
+        self.create_project()
+        data = {
+            "title": "Test Query",
+            "displayType": "table",
+            "widgetType": "discover",
+            "limit": 5,
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "",
+                    "fields": [],
+                    "columns": ["total.count"],
+                    "aggregates": ["count()"],
+                }
+            ],
+        }
+        response = self.do_request(
+            "post",
+            self.url(),
+            data=data,
+        )
+        assert response.status_code == 200, response.data
+
+    def test_accepts_environment_for_filters_that_require_single_env(self):
+        mock_project = self.create_project()
+        self.create_environment(project=mock_project, name="mock_env")
+        data = {
+            "title": "Test Query",
+            "displayType": "table",
+            "widgetType": "discover",
+            "limit": 5,
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "release.stage:adopted",
+                    "fields": [],
+                    "columns": [],
+                    "aggregates": ["count()"],
+                }
+            ],
+        }
+        response = self.client.post(f"{self.url()}?environment=mock_env", data)
+        assert response.status_code == 200, response.data
+
+    def test_dashboard_widget_ondemand_one_field(self):
+        mock_project = self.create_project()
+        self.create_environment(project=mock_project, name="mock_env")
+        data = {
+            "title": "Test Query",
+            "displayType": "table",
+            "widgetType": "discover",
+            "limit": 5,
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "release.stage:adopted",
+                    "columns": ["sometag"],
+                    "fields": [],
+                    "aggregates": ["count()"],
+                }
+            ],
+        }
+        with self.feature(ONDEMAND_FEATURES):
+            response = self.client.post(f"{self.url()}?environment=mock_env", data)
+        assert response.status_code == 200, response.data
+        # There's no data, so `sometag` should be low cardinality
+        assert len(response.data) == 1
+        assert response.data == {"warnings": {"columns": {}, "queries": [None]}}
+        # We cache so we shouldn't call query cardinality again if all the keys are the same
+        with self.feature(ONDEMAND_FEATURES):
+            with mock.patch(
+                "sentry.tasks.on_demand_metrics._query_cardinality", return_value=([], [])
+            ) as mock_query:
+                self.client.post(f"{self.url()}?environment=mock_env", data)
+                assert len(mock_query.mock_calls) == 0
+
+        data = {
+            "title": "Test Query",
+            "displayType": "table",
+            "widgetType": "discover",
+            "limit": 5,
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "release.stage:adopted",
+                    "columns": ["someothertag", "sometag"],
+                    "fields": [],
+                    "aggregates": ["count()"],
+                }
+            ],
+        }
+        # If there's a new key we should only query that key
+        with self.feature(ONDEMAND_FEATURES):
+            with mock.patch(
+                "sentry.tasks.on_demand_metrics._query_cardinality", return_value=([], [])
+            ) as mock_query:
+                self.client.post(f"{self.url()}?environment=mock_env", data)
+                mock_query.assert_called_once()
+                assert mock_query.mock_calls[0] == mock.call(["someothertag"], mock.ANY, "1h")
+
+    @mock.patch("sentry.tasks.on_demand_metrics._query_cardinality")
+    def test_dashboard_widget_ondemand_multiple_fields(self, mock_query):
+        mock_query.return_value = {
+            "data": [{"count_unique(sometag)": 1_000_000, "count_unique(someothertag)": 1}]
+        }, [
+            "sometag",
+            "someothertag",
         ]
-        response = self.get_response(
-            self.organization.slug,
-            self.dashboard.id,
-            self.widget.id,
-            displayType='line',
-            title='User Happiness',
-            dataSources=data_sources,
-        )
+        mock_project = self.create_project()
+        self.create_environment(project=mock_project, name="mock_env")
+        data = {
+            "title": "Test Query",
+            "displayType": "table",
+            "widgetType": "discover",
+            "limit": 5,
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "release.stage:adopted",
+                    "columns": ["sometag", "someothertag"],
+                    "fields": [],
+                    "aggregates": ["count()"],
+                }
+            ],
+        }
 
-        assert response.status_code == 200
+        with self.feature(ONDEMAND_FEATURES):
+            response = self.client.post(f"{self.url()}?environment=mock_env", data)
+        assert response.status_code == 200, response.data
+        warnings = response.data["warnings"]
+        assert "columns" in warnings
+        assert len(warnings["columns"]) == 1
+        assert warnings["columns"]["sometag"] == "disabled:high-cardinality"
 
-        self.assert_widget_data(
-            response.data,
-            order='1',
-            title='User Happiness',
-            display_type='line',
-            data_sources=data_sources,
-        )
+        # We queried sometag already, we shouldn't call the cardinality query again
+        data = {
+            "title": "Test Query",
+            "displayType": "table",
+            "widgetType": "discover",
+            "limit": 5,
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "release.stage:adopted",
+                    "columns": ["sometag"],
+                    "fields": [],
+                    "aggregates": ["count()"],
+                }
+            ],
+        }
+        with self.feature(ONDEMAND_FEATURES):
+            self.client.post(f"{self.url()}?environment=mock_env", data)
+        assert len(mock_query.mock_calls) == 1
 
-        widgets = Widget.objects.filter(
-            dashboard_id=self.dashboard.id
-        )
-        assert len(widgets) == 1
-
-        self.assert_widget(
-            widgets[0],
+    @mock.patch("sentry.relay.config.metric_extraction.get_max_widget_specs", return_value=1)
+    def test_dashboard_hits_max_specs(self, mock_max):
+        # create another widget so we already have a widget spec
+        self.widget_1 = DashboardWidget.objects.create(
+            dashboard=self.dashboard,
             order=1,
-            title='User Happiness',
-            display_type=WidgetDisplayTypes.LINE_CHART,
-            data_sources=data_sources,
+            title="Widget 1",
+            display_type=DashboardWidgetDisplayTypes.TABLE,
+            widget_type=DashboardWidgetTypes.DISCOVER,
+            interval="1d",
+            limit=5,
+            detail={"layout": {"x": 1, "y": 0, "w": 1, "h": 1, "minH": 2}},
+        )
+        self.widget_1_data_1 = DashboardWidgetQuery.objects.create(
+            widget=self.widget_1,
+            name=self.anon_users_query["name"],
+            fields=self.anon_users_query["fields"],
+            columns=self.anon_users_query["columns"],
+            aggregates=self.anon_users_query["aggregates"],
+            field_aliases=self.anon_users_query["fieldAliases"],
+            conditions=self.anon_users_query["conditions"],
+            order=0,
+        )
+        DashboardWidgetQueryOnDemand.objects.create(
+            dashboard_widget_query=self.widget_1_data_1,
+            spec_version=OnDemandMetricSpecVersioning.get_query_spec_version(
+                self.organization
+            ).version,
+            spec_hashes=["abcd"],
+            extraction_state="enabled:manual",
         )
 
-    def test_widget_no_data_souces(self):
-        WidgetDataSource.objects.create(
-            name='knownUsersAffectedQuery_2',
-            data=self.known_users_query,
-            type=WidgetDataSourceTypes.DISCOVER_SAVED_SEARCH,
+        mock_project = self.create_project()
+        self.create_environment(project=mock_project, name="mock_env")
+        data = {
+            "title": "Test Query",
+            "displayType": "table",
+            "widgetType": "discover",
+            "limit": 5,
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "release.stage:adopted",
+                    "columns": ["sometag", "someothertag"],
+                    "fields": [],
+                    "aggregates": ["count()"],
+                }
+            ],
+        }
+
+        with self.feature(ONDEMAND_FEATURES):
+            response = self.client.post(f"{self.url()}?environment=mock_env", data)
+        assert response.status_code == 200, response.data
+        warnings = response.data["warnings"]
+        assert warnings["queries"][0] == "disabled:spec-limit"
+
+        mock_max.return_value = 100
+        # With higher max, we shouldn't hit the spec-limit
+        with self.feature(ONDEMAND_FEATURES):
+            response = self.client.post(f"{self.url()}?environment=mock_env", data)
+        assert response.status_code == 200, response.data
+        assert response.data == {"warnings": {"columns": {}, "queries": [None]}}
+
+    @mock.patch("sentry.tasks.on_demand_metrics._query_cardinality")
+    def test_warnings_show_up_with_error(self, mock_query):
+        mock_query.return_value = {
+            "data": [{"count_unique(sometag)": 1_000_000, "count_unique(someothertag)": 1}]
+        }, [
+            "sometag",
+            "someothertag",
+        ]
+        mock_project = self.create_project()
+        self.create_environment(project=mock_project, name="mock_env")
+        data = {
+            "title": "Test Query",
+            "displayType": "table",
+            "widgetType": "discover",
+            "limit": 5,
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "release.stage: adopted",
+                    "columns": ["sometag", "someothertag"],
+                    "fields": [],
+                    "aggregates": ["count()"],
+                }
+            ],
+        }
+
+        with self.feature(ONDEMAND_FEATURES):
+            response = self.client.post(f"{self.url()}?environment=mock_env", data)
+        assert response.status_code == 400, response.data
+        warnings = response.data["warnings"]
+        assert "queries" in warnings
+        assert len(warnings["queries"]) == 1
+        assert warnings["queries"][0] == "disabled:not-applicable"
+        assert response.data["queries"][0]["conditions"], response.data
+
+    @mock.patch("sentry.relay.config.metric_extraction.get_max_widget_specs", return_value=1)
+    def test_first_query_without_ondemand_but_second_with(self, mock_max):
+        # create another widget so we already have a widget spec
+        self.widget_1 = DashboardWidget.objects.create(
+            dashboard=self.dashboard,
             order=1,
-            widget_id=self.widget.id,
+            title="Widget 1",
+            display_type=DashboardWidgetDisplayTypes.TABLE,
+            widget_type=DashboardWidgetTypes.DISCOVER,
+            interval="1d",
+            limit=5,
+            detail={"layout": {"x": 1, "y": 0, "w": 1, "h": 1, "minH": 2}},
         )
-        response = self.get_response(
-            self.organization.slug,
-            self.dashboard.id,
-            self.widget.id,
-            displayType='line',
-            title='User Happiness',
-            dataSources=[],
+        self.widget_1_data_1 = DashboardWidgetQuery.objects.create(
+            widget=self.widget_1,
+            name=self.anon_users_query["name"],
+            fields=self.anon_users_query["fields"],
+            columns=self.anon_users_query["columns"],
+            aggregates=self.anon_users_query["aggregates"],
+            field_aliases=self.anon_users_query["fieldAliases"],
+            conditions=self.anon_users_query["conditions"],
+            order=0,
         )
-        assert response.status_code == 200
-        self.assert_widget_data(
-            response.data,
-            order='1',
-            title='User Happiness',
-            display_type='line',
+        DashboardWidgetQueryOnDemand.objects.create(
+            dashboard_widget_query=self.widget_1_data_1,
+            spec_version=OnDemandMetricSpecVersioning.get_query_spec_version(
+                self.organization
+            ).version,
+            spec_hashes=["abcd"],
+            extraction_state="enabled:manual",
         )
 
-        widgets = Widget.objects.filter(
-            dashboard_id=self.dashboard.id
-        )
-        assert len(widgets) == 1
+        mock_project = self.create_project()
+        self.create_environment(project=mock_project, name="mock_env")
+        data = {
+            "title": "Test Query",
+            "displayType": "table",
+            "widgetType": "discover",
+            "limit": 5,
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "release.stage:adopted",
+                    "columns": ["sometag", "someothertag"],
+                    "fields": [],
+                    "aggregates": ["count()"],
+                    "onDemandExtractionDisabled": True,
+                },
+                {
+                    "name": "",
+                    "conditions": "release.stage:adopted",
+                    "columns": ["sometag", "someothertag"],
+                    "fields": [],
+                    "aggregates": ["count()"],
+                },
+            ],
+        }
 
-        self.assert_widget(
-            widgets[0],
-            order=1,
-            title='User Happiness',
-            display_type=WidgetDisplayTypes.LINE_CHART,
-        )
-        assert not WidgetDataSource.objects.filter(
-            widget_id=widgets[0],
-        ).exists()
+        with self.feature(ONDEMAND_FEATURES):
+            response = self.client.post(f"{self.url()}?environment=mock_env", data)
+        assert response.status_code == 200, response.data
+        warnings = response.data["warnings"]
+        assert len(warnings["queries"]) == 2
+        assert warnings["queries"][0] is None
+        assert warnings["queries"][1] == "disabled:spec-limit"
 
-    def test_unrecognized_display_type(self):
-        response = self.get_response(
-            self.organization.slug,
-            self.dashboard.id,
-            self.widget.id,
-            displayType='happy-face',
-            title='User Happiness',
-        )
-        assert response.status_code == 400
-        assert response.data == {'displayType': [u'Widget displayType happy-face not recognized.']}
+    def test_on_demand_doesnt_query(self):
+        mock_project = self.create_project()
+        self.create_environment(project=mock_project, name="mock_env")
+        data = {
+            "title": "Test Query",
+            "displayType": "table",
+            "widgetType": "discover",
+            "limit": 5,
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "release.stage:adopted",
+                    "columns": ["sometag"],
+                    "fields": [],
+                    "aggregates": ["count()"],
+                }
+            ],
+        }
+        with mock.patch("sentry.tasks.on_demand_metrics._query_cardinality") as mock_query:
+            response = self.client.post(f"{self.url()}?environment=mock_env", data)
+        assert response.status_code == 200, response.data
+        # There's no data, so `sometag` should be low cardinality
 
-    def test_unrecognized_data_source_type(self):
-        response = self.get_response(
-            self.organization.slug,
-            self.dashboard.id,
-            self.widget.id,
-            title='User Happiness',
-            displayType='line',
-            dataSources=[{
-                'name': 'knownUsersAffectedQuery_3',
-                'data': self.known_users_query,
-                'type': 'not-real-type',
-                'order': 1,
-            }],
-        )
-        assert response.status_code == 400
-        assert response.data == {'dataSources':
-                                 {'type': ['Widget data source type not-real-type not recognized.']}}
+        data = {
+            "title": "Test Query",
+            "displayType": "table",
+            "widgetType": "discover",
+            "limit": 5,
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "release.stage:adopted",
+                    "columns": ["sometag"],
+                    "fields": [],
+                    "aggregates": ["count()"],
+                    "onDemandExtractionDisabled": True,
+                }
+            ],
+        }
+        # With extraction disabled we shouldn't check
+        with mock.patch("sentry.tasks.on_demand_metrics._query_cardinality") as mock_query:
+            self.client.post(f"{self.url()}?environment=mock_env", data)
+            assert len(mock_query.mock_calls) == 0
 
-    def test_does_not_exists(self):
-        response = self.get_response(
-            self.organization.slug,
-            self.dashboard.id,
-            1234567890,
-            displayType='line',
-            title='User Happiness',
-        )
-        assert response.status_code == 404
+    @mock.patch("sentry.relay.config.metric_extraction.get_max_widget_specs", return_value=1)
+    def test_ondemand_disabled_adds_queries(self, mock_max):
+        mock_project = self.create_project()
+        self.create_environment(project=mock_project, name="mock_env")
+        data = {
+            "title": "Test Query",
+            "displayType": "table",
+            "widgetType": "discover",
+            "limit": 5,
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "release.stage:adopted",
+                    "columns": ["sometag", "someothertag"],
+                    "fields": [],
+                    "aggregates": ["count()"],
+                    "onDemandExtractionDisabled": True,
+                },
+                {
+                    "name": "",
+                    "conditions": "release.stage:adopted",
+                    "columns": ["sometag", "someothertag"],
+                    "fields": [],
+                    "onDemandExtractionDisabled": True,
+                },
+            ],
+        }
 
-    def test_widget_does_not_belong_to_dashboard(self):
-        dashboard = Dashboard.objects.create(
-            title='Dashboard 2',
-            created_by=self.user,
-            organization=self.organization,
-        )
-        widget = Widget.objects.create(
-            dashboard_id=dashboard.id,
-            order=1,
-            title='Widget 2',
-            display_type=WidgetDisplayTypes.LINE_CHART,
-        )
-        response = self.get_response(
-            self.organization.slug,
-            self.dashboard.id,
-            widget.id,
-            displayType='line',
-            title='Happy Widget 2',
-        )
-        assert response.status_code == 404
+        with self.feature(ONDEMAND_FEATURES):
+            response = self.client.post(f"{self.url()}?environment=mock_env", data)
+        assert response.status_code == 200, response.data
+        warnings = response.data["warnings"]
+        assert len(warnings["queries"]) == 2
+        assert response.data == {"warnings": {"columns": {}, "queries": [None, None]}}
 
-    def test_widget_does_not_belong_to_organization(self):
-        dashboard = Dashboard.objects.create(
-            title='Dashboard 2',
-            created_by=self.user,
-            organization=self.create_organization(),
+    def test_widget_cardinality(self):
+        self.store_event(
+            data={
+                "event_id": "a" * 32,
+                "transaction": "/example",
+                "message": "how to make fast",
+                "timestamp": before_now(minutes=2).timestamp(),
+                "tags": {"sometag": "foo"},
+            },
+            project_id=self.project.id,
         )
-        widget = Widget.objects.create(
-            dashboard_id=dashboard.id,
-            order=1,
-            title='Widget 2',
-            display_type=WidgetDisplayTypes.LINE_CHART,
-        )
-        response = self.get_response(
-            self.organization.slug,
-            dashboard.id,
-            widget.id,
-            displayType='line',
-            title='Happy Widget 2',
-        )
-        assert response.status_code == 404
+        project = self.create_project()
+        self.create_environment(project=project, name="mock_env")
+        data = {
+            "title": "Test Query",
+            "displayType": "table",
+            "widgetType": "discover",
+            "limit": 5,
+            "queries": [
+                {
+                    "name": "",
+                    "conditions": "release.stage:adopted",
+                    "columns": ["sometag"],
+                    "fields": [],
+                    "aggregates": ["count()"],
+                }
+            ],
+        }
 
+        option_get = options.get
 
-class OrganizationDashboardWidgetsDeleteTestCase(OrganizationDashboardWidgetDetailsTestCase):
-    method = 'delete'
+        def mock_options(option_name):
+            if option_name == "on_demand.max_widget_cardinality.on_query_count":
+                return 0
+            else:
+                return option_get(option_name)
 
-    def assert_deleted_widget(self, widget_id):
-        assert not Widget.objects.filter(id=widget_id).exists()
-        assert not WidgetDataSource.objects.filter(widget_id=widget_id).exists()
-
-    def test_simple(self):
-        response = self.get_response(
-            self.organization.slug,
-            self.dashboard.id,
-            self.widget.id,
-        )
-        assert response.status_code == 204
-        self.assert_deleted_widget(self.widget.id)
-
-    def test_with_data_sources(self):
-        WidgetDataSource.objects.create(
-            widget_id=self.widget.id,
-            name='Data source 1',
-            data=self.known_users_query,
-            type=WidgetDataSourceTypes.DISCOVER_SAVED_SEARCH,
-            order=1,
-        )
-        WidgetDataSource.objects.create(
-            widget_id=self.widget.id,
-            name='Data source 2',
-            data=self.known_users_query,
-            type=WidgetDataSourceTypes.DISCOVER_SAVED_SEARCH,
-            order=2,
-        )
-        response = self.get_response(
-            self.organization.slug,
-            self.dashboard.id,
-            self.widget.id,
-        )
-        assert response.status_code == 204
-        self.assert_deleted_widget(self.widget.id)
-
-    def test_does_not_exists(self):
-        response = self.get_response(
-            self.organization.slug,
-            self.dashboard.id,
-            1234567890,
-        )
-        assert response.status_code == 404
-
-    def test_widget_does_not_belong_to_dashboard(self):
-        dashboard = Dashboard.objects.create(
-            title='Dashboard 2',
-            created_by=self.user,
-            organization=self.organization,
-        )
-        widget = Widget.objects.create(
-            dashboard_id=dashboard.id,
-            order=1,
-            title='Widget 2',
-            display_type=WidgetDisplayTypes.LINE_CHART,
-        )
-        response = self.get_response(
-            self.organization.slug,
-            self.dashboard.id,
-            widget.id,
-            displayType='line',
-            title='Happy Widget 2',
-        )
-        assert response.status_code == 404
-
-    def test_widget_does_not_belong_to_organization(self):
-        dashboard = Dashboard.objects.create(
-            title='Dashboard 2',
-            created_by=self.user,
-            organization=self.create_organization(),
-        )
-        widget = Widget.objects.create(
-            dashboard_id=dashboard.id,
-            order=1,
-            title='Widget 2',
-            display_type=WidgetDisplayTypes.LINE_CHART,
-        )
-        response = self.get_response(
-            self.organization.slug,
-            dashboard.id,
-            widget.id,
-            displayType='line',
-            title='Happy Widget 2',
-        )
-        assert response.status_code == 404
+        with mock.patch("sentry.options.get", side_effect=mock_options):
+            with self.feature(ONDEMAND_FEATURES):
+                response = self.client.post(f"{self.url()}?environment=mock_env", data)
+        assert response.status_code == 200, response.data
+        warnings = response.data["warnings"]
+        assert "columns" in warnings
+        assert len(warnings["columns"]) == 1
+        assert warnings["columns"]["sometag"] == "disabled:high-cardinality"

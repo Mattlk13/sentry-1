@@ -1,20 +1,17 @@
-from __future__ import absolute_import, print_function
+__all__ = ["ProviderManager"]
 
-__all__ = ['ProviderManager']
-
-import six
 
 from .exceptions import ProviderNotRegistered
 
 
 # Ideally this and PluginManager abstracted from the same base, but
-# InstanceManager has become convulated and wasteful
-class ProviderManager(object):
+# InstanceManager has become convoluted and wasteful
+class ProviderManager:
     def __init__(self):
         self.__values = {}
 
     def __iter__(self):
-        return six.iteritems(self.__values)
+        yield from self.__values.items()
 
     def get(self, key, **kwargs):
         try:
@@ -23,7 +20,7 @@ class ProviderManager(object):
             raise ProviderNotRegistered(key)
         return cls(key=key, **kwargs)
 
-    def exists(self, key):
+    def exists(self, key: str) -> bool:
         return key in self.__values
 
     def register(self, key, cls):
@@ -32,7 +29,7 @@ class ProviderManager(object):
     def unregister(self, key, cls):
         try:
             if self.__values[key] != cls:
-                # dont allow unregistering of arbitrary provider
+                # don't allow unregistering of arbitrary provider
                 raise ProviderNotRegistered(key)
         except KeyError:
             # we gracefully handle a missing provider

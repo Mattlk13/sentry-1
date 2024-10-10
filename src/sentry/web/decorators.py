@@ -1,24 +1,28 @@
-from __future__ import absolute_import
-
+from collections.abc import Callable
 from functools import wraps
-from django.core.urlresolvers import reverse
-from django.http import HttpResponseRedirect
-from django.contrib import messages
-from django.utils.translation import ugettext_lazy as _
+from typing import Any
+
+from django.http import HttpResponse, HttpResponseRedirect
+from django.urls import reverse
+from django.utils.translation import gettext_lazy as _
+from rest_framework.request import Request
 
 from sentry.utils import auth
 
-ERR_BAD_SIGNATURE = _('The link you followed is invalid or expired.')
+ERR_BAD_SIGNATURE = _("The link you followed is invalid or expired.")
+
+# TODO(mgaeta): It's not currently possible to type a Callable's args with kwargs.
+EndpointFunc = Callable[..., HttpResponse]
 
 
-def login_required(func):
+def login_required(func: EndpointFunc) -> EndpointFunc:
     @wraps(func)
-    def wrapped(request, *args, **kwargs):
-        if not request.user.is_authenticated():
+    def wrapped(request: Request, *args: Any, **kwargs: Any) -> HttpResponse:
+        if not request.user.is_authenticated:
             auth.initiate_login(request, next_url=request.get_full_path())
-            if 'organization_slug' in kwargs:
+            if "organization_slug" in kwargs:
                 redirect_uri = reverse(
-                    'sentry-auth-organization', args=[kwargs['organization_slug']]
+                    "sentry-auth-organization", args=[kwargs["organization_slug"]]
                 )
             else:
                 redirect_uri = auth.get_login_url()
@@ -28,12 +32,14 @@ def login_required(func):
     return wrapped
 
 
-def signed_auth_required(func):
-    @wraps(func)
-    def wrapped(request, *args, **kwargs):
-        if not request.user_from_signed_request:
-            messages.add_message(request, messages.ERROR, ERR_BAD_SIGNATURE)
-            return HttpResponseRedirect(auth.get_login_url())
-        return func(request, *args, **kwargs)
+def set_referrer_policy(policy: str) -> Callable[[EndpointFunc], EndpointFunc]:
+    def real_decorator(func: EndpointFunc) -> EndpointFunc:
+        @wraps(func)
+        def wrapped(request: Request, *args: Any, **kwargs: Any) -> HttpResponse:
+            response = func(request, *args, **kwargs)
+            response["Referrer-Policy"] = policy
+            return response
 
-    return wrapped
+        return wrapped
+
+    return real_decorator

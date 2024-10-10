@@ -1,31 +1,45 @@
-from __future__ import absolute_import, print_function
+from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
-from django.conf import settings
+from django.contrib.auth.models import AnonymousUser
 from django.utils import timezone
+
+from sentry.users.services.user.model import RpcUser
 
 from .emails import generate_security_email
 
-logger = logging.getLogger('sentry.security')
+if TYPE_CHECKING:
+    from sentry.users.models.user import User
+
+
+logger = logging.getLogger("sentry.security")
 
 
 def capture_security_activity(
-    account, type, actor, ip_address, context=None, send_email=True, current_datetime=None
-):
+    account: User | RpcUser | AnonymousUser,
+    type: str,  # FIXME: "type" is a built-in function, so this isn't a great name
+    actor: User | RpcUser | AnonymousUser,
+    ip_address: str,
+    context: Mapping[str, Any] | None = None,
+    send_email: bool = True,
+    current_datetime: datetime | None = None,
+) -> None:
     if current_datetime is None:
         current_datetime = timezone.now()
 
-    logger_context = {
-        'ip_address': ip_address,
-        'user_id': account.id,
-        'actor_id': actor.id,
-    }
+    assert not isinstance(account, AnonymousUser)
 
-    if type == 'mfa-removed' or type == 'mfa-added':
-        logger_context['authenticator_id'] = context['authenticator'].id
+    logger_context = {"ip_address": ip_address, "user_id": account.id, "actor_id": actor.id}
 
-    logger.info(u'user.{}'.format(type), extra=logger_context)
+    if type == "mfa-removed" or type == "mfa-added":
+        assert context is not None
+        logger_context["authenticator_id"] = context["authenticator"].id
+
+    logger.info("user.%s", type, extra=logger_context)
 
     if send_email:
         msg = generate_security_email(
@@ -37,7 +51,3 @@ def capture_security_activity(
             current_datetime=current_datetime,
         )
         msg.send_async([account.email])
-
-
-def is_valid_email_address(value):
-    return not settings.INVALID_EMAIL_ADDRESS_PATTERN.search(value)

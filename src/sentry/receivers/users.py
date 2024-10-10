@@ -1,40 +1,33 @@
-from __future__ import absolute_import, print_function
+import sys
 
-from django.db import router
-from django.db.models.signals import post_syncdb
+from sentry.signals import post_upgrade
+from sentry.silo.base import SiloMode
+from sentry.users.models.user import User
+from sentry.utils.settings import is_self_hosted
 
-from sentry.models import User
 
-
-def create_first_user(created_models, verbosity, db, app=None, **kwargs):
-    # this is super confusing
-    if app and app.__name__ != 'sentry.models':
+def create_first_user(**kwargs):
+    if User.objects.filter(is_superuser=True).exists():
         return
 
-    if User not in created_models:
+    if not sys.stdin.isatty() and not is_self_hosted():
         return
 
-    if hasattr(router, 'allow_migrate'):
-        if not router.allow_migrate(db, User):
-            return
-    else:
-        if not router.allow_syncdb(db, User):
-            return
-    if not kwargs.get('interactive', True):
+    if not kwargs["interactive"]:
         return
 
     import click
-    if not click.confirm('\nWould you like to create a user account now?', default=True):
+
+    if not click.confirm("\nWould you like to create a user account now?", default=True):
         # Not using `abort=1` because we don't want to exit out from further execution
-        click.echo('\nRun `sentry createuser` to do this later.\n')
+        click.echo("\nRun `sentry createuser` to do this later.\n")
         return
 
     from sentry.runner import call_command
-    call_command('sentry.runner.commands.createuser.createuser', superuser=True)
+
+    call_command("sentry.runner.commands.createuser.createuser", superuser=True)
 
 
-post_syncdb.connect(
-    create_first_user,
-    dispatch_uid="create_first_user",
-    weak=False,
+post_upgrade.connect(
+    create_first_user, dispatch_uid="create_first_user", weak=False, sender=SiloMode.MONOLITH
 )

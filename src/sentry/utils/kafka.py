@@ -1,35 +1,46 @@
-from __future__ import absolute_import
-
 import logging
+import signal
+import time
+from threading import Thread
 
-from django.conf import settings
-
+from sentry import options
 
 logger = logging.getLogger(__name__)
 
 
-class ProducerManager(object):
-    """\
-    Manages one `confluent_kafka.Producer` per Kafka cluster.
-
-    See `KAFKA_CLUSTERS` and `KAFKA_TOPICS` in settings.
+def delay_kafka_rebalance(configured_delay: int) -> None:
+    """
+    Introduces a configurable delay to the consumer topic
+    subscription and consumer shutdown steps (handled by the
+    StreamProcessor). The idea behind is that by forcing
+    these steps to occur at certain time "ticks" (for example, at
+    every 15 second tick in a minute), we can reduce the number of
+    rebalances that are triggered during a deploy. This means
+    fewer "stop the world rebalancing" occurrences and more time
+    for the consumer group to stabilize and make progress.
     """
 
-    def __init__(self):
-        self.__producers = {}
+    time_elapsed_in_slot = int(time.time()) % configured_delay
 
-    def get(self, key):
-        cluster_name = settings.KAFKA_TOPICS[key]['cluster']
-        producer = self.__producers.get(cluster_name)
-
-        if producer:
-            return producer
-
-        from confluent_kafka import Producer
-
-        cluster_options = settings.KAFKA_CLUSTERS[cluster_name]
-        producer = self.__producers[cluster_name] = Producer(cluster_options)
-        return producer
+    time.sleep(configured_delay - time_elapsed_in_slot)
 
 
-producers = ProducerManager()
+def delay_shutdown(consumer_name, processor) -> None:
+    if consumer_name == "ingest-generic-metrics" and options.get(
+        "sentry-metrics.synchronize-kafka-rebalances"
+    ):
+        configured_delay = options.get("sentry-metrics.synchronized-rebalance-delay")
+        logger.info("Started delay in consumer shutdown step")
+        delay_kafka_rebalance(configured_delay)
+        logger.info("Finished delay in consumer shutdown step")
+    processor.signal_shutdown()
+
+
+def run_processor_with_signals(processor, consumer_name: str | None = None):
+    def handler(signum, frame):
+        t = Thread(target=delay_shutdown, args=(consumer_name, processor))
+        t.start()
+
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+    processor.run()

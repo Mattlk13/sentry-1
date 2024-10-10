@@ -1,104 +1,305 @@
-from __future__ import absolute_import
-
-from sentry import tagstore
-from sentry.testutils import APITestCase
+from sentry.testutils.cases import APITestCase, PerformanceIssueTestCase, SnubaTestCase
+from sentry.testutils.helpers.datetime import before_now
 
 
-class GroupTagsTest(APITestCase):
-    def _create_tags(self, group, environment_id=None):
-        for key, values in group.data['tags']:
-            tagstore.create_tag_key(
-                project_id=group.project_id,
-                environment_id=environment_id,
-                key=key,
-            )
-            tagstore.create_group_tag_key(
-                project_id=group.project_id,
-                group_id=group.id,
-                environment_id=environment_id,
-                key=key,
-            )
-
-            if not isinstance(values, list):
-                values = [values]
-            for value in values:
-                tagstore.create_tag_value(
-                    project_id=group.project_id,
-                    environment_id=environment_id,
-                    key=key,
-                    value=value,
-                )
-                tagstore.create_group_tag_value(
-                    project_id=group.project_id,
-                    group_id=group.id,
-                    environment_id=environment_id,
-                    key=key,
-                    value=value,
-                )
-
+class GroupTagsTest(APITestCase, SnubaTestCase, PerformanceIssueTestCase):
     def test_simple(self):
-        this_group = self.create_group()
-        this_group.data['tags'] = (['foo', ['bar', 'quux']], ['biz', 'baz'], [
-                                   'sentry:release', 'releaseme'])
+        event1 = self.store_event(
+            data={
+                "fingerprint": ["group-1"],
+                "tags": {"foo": "bar", "biz": "baz"},
+                "release": "releaseme",
+                "timestamp": before_now(minutes=1).timestamp(),
+            },
+            project_id=self.project.id,
+        )
+        self.store_event(
+            data={
+                "fingerprint": ["group-1"],
+                "tags": {"foo": "quux"},
+                "release": "releaseme",
+                "timestamp": before_now(minutes=1).timestamp(),
+            },
+            project_id=self.project.id,
+        )
 
-        this_group.save()
-
-        other_group = self.create_group()
-        other_group.data['tags'] = (['abc', 'xyz'],)
-        other_group.save()
-
-        for group in (this_group, other_group):
-            self._create_tags(group)
+        self.store_event(
+            data={
+                "fingerprint": ["group-2"],
+                "tags": {"abc": "xyz"},
+                "timestamp": before_now(minutes=1).timestamp(),
+            },
+            project_id=self.project.id,
+        )
 
         self.login_as(user=self.user)
 
-        url = u'/api/0/issues/{}/tags/'.format(this_group.id)
-        response = self.client.get(url, format='json')
+        url = f"/api/0/issues/{event1.group.id}/tags/"
+        response = self.client.get(url, format="json")
         assert response.status_code == 200, response.content
-        assert len(response.data) == 3
+        assert len(response.data) == 4
 
-        data = sorted(response.data, key=lambda r: r['key'])
-        assert data[0]['key'] == 'biz'
-        assert len(data[0]['topValues']) == 1
+        data = sorted(response.data, key=lambda r: r["key"])
+        assert data[0]["key"] == "biz"
+        assert len(data[0]["topValues"]) == 1
 
-        assert data[1]['key'] == 'foo'
-        assert len(data[1]['topValues']) == 2
+        assert data[1]["key"] == "foo"
+        assert len(data[1]["topValues"]) == 2
 
-        assert data[2]['key'] == 'release'  # Formatted from sentry:release
-        assert len(data[2]['topValues']) == 1
+        assert data[2]["key"] == "level"
+        assert len(data[2]["topValues"]) == 1
+
+        assert data[3]["key"] == "release"  # Formatted from sentry:release
+        assert len(data[3]["topValues"]) == 1
 
         # Use the key= queryparam to grab results for specific tags
-        url = u'/api/0/issues/{}/tags/?key=foo&key=sentry:release'.format(this_group.id)
-        response = self.client.get(url, format='json')
+        url = f"/api/0/issues/{event1.group.id}/tags/?key=foo&key=sentry:release"
+        response = self.client.get(url, format="json")
         assert response.status_code == 200, response.content
         assert len(response.data) == 2
 
-        data = sorted(response.data, key=lambda r: r['key'])
+        data = sorted(response.data, key=lambda r: r["key"])
 
-        assert data[0]['key'] == 'foo'
-        assert len(data[0]['topValues']) == 2
-        assert set(v['value'] for v in data[0]['topValues']) == set(['bar', 'quux'])
+        assert data[0]["key"] == "foo"
+        assert len(data[0]["topValues"]) == 2
+        assert {v["value"] for v in data[0]["topValues"]} == {"bar", "quux"}
 
-        assert data[1]['key'] == 'release'
-        assert len(data[1]['topValues']) == 1
+        assert data[1]["key"] == "release"
+        assert len(data[1]["topValues"]) == 1
+
+    def test_simple_performance(self):
+        event = self.create_performance_issue(
+            tags=[["foo", "bar"], ["biz", "baz"], ["sentry:release", "releaseme"]],
+            fingerprint="group5",
+            contexts={"trace": {"trace_id": "b" * 32, "span_id": "c" * 16, "op": ""}},
+        )
+        self.create_performance_issue(
+            tags=[["foo", "quux"], ["sentry:release", "releaseme"]],
+            fingerprint="group5",
+            contexts={"trace": {"trace_id": "b" * 32, "span_id": "c" * 16, "op": ""}},
+        )
+
+        self.login_as(user=self.user)
+
+        url = f"/api/0/issues/{event.group.id}/tags/"
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200, response.content
+
+        assert len(response.data) == 14
+
+        data = sorted(response.data, key=lambda r: r["key"])
+        assert data[0]["key"] == "biz"
+        assert len(data[0]["topValues"]) == 1
+
+        assert data[8]["key"] == "foo"
+        assert len(data[8]["topValues"]) == 2
+
+        assert data[9]["key"] == "level"
+        assert len(data[9]["topValues"]) == 1
+
+        assert data[10]["key"] == "release"  # Formatted from sentry:release
+        assert len(data[10]["topValues"]) == 1
+
+        assert data[11]["key"] == "transaction"
+        assert len(data[11]["topValues"]) == 1
+
+        # Use the key= queryparam to grab results for specific tags
+        url = f"/api/0/issues/{event.group.id}/tags/?key=foo&key=sentry:release"
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200, response.content
+
+        data = sorted(response.data, key=lambda r: r["key"])
+
+        assert data[0]["key"] == "foo"
+        assert len(data[0]["topValues"]) == 2
+        assert {v["value"] for v in data[0]["topValues"]} == {"bar", "quux"}
+
+        assert data[1]["key"] == "release"
+        assert len(data[1]["topValues"]) == 1
 
     def test_invalid_env(self):
         this_group = self.create_group()
         self.login_as(user=self.user)
-        url = u'/api/0/issues/{}/tags/'.format(this_group.id)
-        response = self.client.get(url, {'environment': 'notreal'}, format='json')
+        url = f"/api/0/issues/{this_group.id}/tags/"
+        response = self.client.get(url, {"environment": "notreal"}, format="json")
         assert response.status_code == 404
 
     def test_valid_env(self):
-        group = self.create_group()
-        group.data['tags'] = (['foo', 'bar'], ['biz', 'baz'])
-        group.save()
-
-        env = self.create_environment(project=group.project)
-        self._create_tags(group, environment_id=env.id)
+        event = self.store_event(
+            data={
+                "tags": {"foo": "bar", "biz": "baz"},
+                "environment": "prod",
+                "timestamp": before_now(minutes=1).timestamp(),
+            },
+            project_id=self.project.id,
+        )
+        group = event.group
 
         self.login_as(user=self.user)
-        url = u'/api/0/issues/{}/tags/'.format(group.id)
-        response = self.client.get(url, {'environment': env.name}, format='json')
+        url = f"/api/0/issues/{group.id}/tags/"
+        response = self.client.get(url, {"environment": "prod"}, format="json")
         assert response.status_code == 200
-        assert len(response.data) == 2
+        assert len(response.data) == 4
+        assert {tag["key"] for tag in response.data} == {"foo", "biz", "environment", "level"}
+
+    def test_multi_env(self):
+        min_ago = before_now(minutes=1)
+        env = self.create_environment(project=self.project, name="prod")
+        env2 = self.create_environment(project=self.project, name="staging")
+        self.store_event(
+            data={
+                "fingerprint": ["put-me-in-group1"],
+                "timestamp": min_ago.timestamp(),
+                "environment": env.name,
+                "tags": {"foo": "bar"},
+            },
+            project_id=self.project.id,
+        )
+        event2 = self.store_event(
+            data={
+                "fingerprint": ["put-me-in-group1"],
+                "timestamp": min_ago.timestamp(),
+                "environment": env2.name,
+                "tags": {"biz": "baz"},
+            },
+            project_id=self.project.id,
+        )
+
+        self.login_as(user=self.user)
+        url = f"/api/0/issues/{event2.group.id}/tags/"
+        response = self.client.get(
+            f"{url}?environment={env.name}&environment={env2.name}", format="json"
+        )
+        assert response.status_code == 200
+        assert {tag["key"] for tag in response.data} >= {"biz", "environment", "foo"}
+
+    def test_readable_tag_values(self):
+        event1 = self.store_event(
+            data={
+                "fingerprint": ["group-1"],
+                "tags": {"device": "SM-G9910"},
+                "timestamp": before_now(minutes=1).timestamp(),
+            },
+            project_id=self.project.id,
+        )
+        self.store_event(
+            data={
+                "fingerprint": ["group-1"],
+                "tags": {"device": "iPhone14,3"},
+                "timestamp": before_now(minutes=1).timestamp(),
+            },
+            project_id=self.project.id,
+        )
+        self.store_event(
+            data={
+                "fingerprint": ["group-1"],
+                "tags": {"device": "random-model"},
+                "timestamp": before_now(minutes=1).timestamp(),
+            },
+            project_id=self.project.id,
+        )
+
+        self.login_as(user=self.user)
+
+        url = f"/api/0/issues/{event1.group.id}/tags/?readable=true&key=device"
+        response = self.client.get(url, format="json")
+
+        assert response.status_code == 200, response.content
+        assert len(response.data) == 1
+        assert response.data[0]["key"] == "device"
+
+        top_values = sorted(response.data[0]["topValues"], key=lambda r: r["value"])
+        assert len(top_values) == 3
+        assert top_values[0]["value"] == "SM-G9910"
+        assert top_values[0]["readable"] == "Galaxy S21 5G"
+        assert top_values[1]["value"] == "iPhone14,3"
+        assert top_values[1]["readable"] == "iPhone 13 Pro Max"
+        assert top_values[2]["value"] == "random-model"
+        assert "readable" not in top_values[2]
+
+    def test_limit(self):
+        for _ in range(3):
+            self.store_event(
+                data={
+                    "fingerprint": ["group-1"],
+                    "tags": {"os": "iOS"},
+                    "timestamp": before_now(minutes=1).timestamp(),
+                },
+                project_id=self.project.id,
+            )
+        for _ in range(2):
+            self.store_event(
+                data={
+                    "fingerprint": ["group-1"],
+                    "tags": {"os": "android"},
+                    "timestamp": before_now(minutes=1).timestamp(),
+                },
+                project_id=self.project.id,
+            )
+        event = self.store_event(
+            data={
+                "fingerprint": ["group-1"],
+                "tags": {"os": "windows"},
+                "timestamp": before_now(minutes=1).timestamp(),
+            },
+            project_id=self.project.id,
+        )
+
+        self.login_as(user=self.user)
+
+        url = f"/api/0/issues/{event.group.id}/tags/?limit=2&key=os"
+        response = self.client.get(url, format="json")
+
+        assert response.status_code == 200, response.content
+        assert len(response.data) == 1
+        assert response.data[0]["key"] == "os"
+        assert response.data[0]["totalValues"] == 6
+
+        top_values = sorted(response.data[0]["topValues"], key=lambda r: r["value"])
+        assert len(top_values) == 2
+        assert top_values[0]["value"] == "android"
+        assert top_values[1]["value"] == "iOS"
+
+    def test_device_class(self):
+        for _ in range(3):
+            self.store_event(
+                data={
+                    "fingerprint": ["group-1"],
+                    "tags": {"device.class": "1"},
+                    "timestamp": before_now(minutes=1).timestamp(),
+                },
+                project_id=self.project.id,
+            )
+        for _ in range(2):
+            self.store_event(
+                data={
+                    "fingerprint": ["group-1"],
+                    "tags": {"device.class": "2"},
+                    "timestamp": before_now(minutes=1).timestamp(),
+                },
+                project_id=self.project.id,
+            )
+        event = self.store_event(
+            data={
+                "fingerprint": ["group-1"],
+                "tags": {"device.class": "3"},
+                "timestamp": before_now(minutes=1).timestamp(),
+            },
+            project_id=self.project.id,
+        )
+
+        self.login_as(user=self.user)
+
+        url = f"/api/0/issues/{event.group.id}/tags/?limit=3&key=device.class"
+        response = self.client.get(url, format="json")
+
+        assert response.status_code == 200, response.content
+        assert len(response.data) == 1
+        assert response.data[0]["key"] == "device.class"
+        assert response.data[0]["totalValues"] == 6
+
+        top_values = sorted(response.data[0]["topValues"], key=lambda r: r["value"])
+        assert len(top_values) == 3
+        assert top_values[0]["value"] == "high"
+        assert top_values[1]["value"] == "low"
+        assert top_values[2]["value"] == "medium"

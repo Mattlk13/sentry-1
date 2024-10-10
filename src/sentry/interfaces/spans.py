@@ -1,20 +1,18 @@
-from __future__ import absolute_import
-
-__all__ = ('Spans', 'Span')
+__all__ = ("Spans", "Span")
 
 from sentry.interfaces.base import Interface
 
 SPAN_KEYS = (
-    'trace_id',
-    'parent_span_id',
-    'span_id',
-    'start_timestamp',
-    'same_process_as_parent',
-    'description',
-    'tags',
-    'timestamp',
-    'op',
-    'data'
+    "trace_id",
+    "parent_span_id",
+    "span_id",
+    "start_timestamp",
+    "same_process_as_parent",
+    "description",
+    "tags",
+    "timestamp",
+    "op",
+    "data",
 )
 
 
@@ -40,25 +38,28 @@ class Span(Interface):
     >>>   }
     >>> }
     """
+
     @classmethod
-    def to_python(cls, data):
+    def to_python(cls, data, **kwargs):
         for key in SPAN_KEYS:
             data.setdefault(key, None)
-        return cls(**data)
+
+        return super().to_python(data, **kwargs)
 
 
 class Spans(Interface):
     """
     Contains a list of Span interfaces
     """
+
     display_score = 1950
     score = 1950
-    path = 'spans'
+    path = "spans"
 
     @classmethod
-    def to_python(cls, data):
-        spans = [Span.to_python(span) for span in data]
-        return cls(spans=spans)
+    def to_python(cls, data, **kwargs):
+        spans = [Span.to_python_subpath(data, [i], **kwargs) for i, span in enumerate(data)]
+        return super().to_python({"spans": spans}, **kwargs)
 
     def __iter__(self):
         return iter(self.spans)

@@ -1,8 +1,6 @@
-from __future__ import absolute_import, print_function
-
 from .manager import ProjectOptionsManager
 
-__all__ = ('get', 'set', 'delete', 'register', 'isset', 'lookup_key')
+__all__ = ("get", "set", "delete", "register", "isset", "LATEST_EPOCH")
 
 default_manager = ProjectOptionsManager()
 
@@ -14,7 +12,6 @@ register = default_manager.register
 all = default_manager.all
 isset = default_manager.isset
 lookup_well_known_key = default_manager.lookup_well_known_key
-update_rev_for_option = default_manager.update_rev_for_option
 
 
 def get_well_known_default(key, project=None, epoch=None):
@@ -25,4 +22,5 @@ def get_well_known_default(key, project=None, epoch=None):
 
 
 from . import defaults  # NOQA
-from .defaults import LATEST_EPOCH  # NOQA
+
+LATEST_EPOCH = defaults.LATEST_EPOCH

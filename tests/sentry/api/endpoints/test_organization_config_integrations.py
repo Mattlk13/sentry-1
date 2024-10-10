@@ -1,23 +1,37 @@
-from __future__ import absolute_import
-
-from django.core.urlresolvers import reverse
-
-from sentry.testutils import APITestCase
+from sentry.testutils.cases import APITestCase
 
 
 class OrganizationConfigIntegrationsTest(APITestCase):
+    endpoint = "sentry-api-0-organization-config-integrations"
+
+    def setUp(self):
+        super().setUp()
+        self.login_as(self.user)
+
     def test_simple(self):
-        self.login_as(user=self.user)
+        response = self.get_success_response(self.organization.slug)
+        assert len(response.data["providers"]) > 0
+        providers = [r for r in response.data["providers"] if r["key"] == "example"]
+        assert len(providers) == 1
+        provider = providers[0]
+        assert provider["name"] == "Example"
+        assert provider["setupDialog"]["url"]
 
-        org = self.create_organization(owner=self.user, name='baz')
+    def test_provider_key(self):
+        response = self.get_success_response(
+            self.organization.slug, qs_params={"provider_key": "example_server"}
+        )
+        assert len(response.data["providers"]) == 1
+        assert response.data["providers"][0]["name"] == "Example Server"
 
-        url = reverse('sentry-api-0-organization-config-integrations', args=[org.slug])
-        response = self.client.get(url)
+    def test_feature_flag_integration(self):
+        response = self.get_success_response(self.organization.slug)
+        provider = [r for r in response.data["providers"] if r["key"] == "feature_flag_integration"]
+        assert len(provider) == 0
 
-        assert response.status_code == 200, response.content
-        assert len(response.data['providers']) > 0
-        provider = [r for r in response.data['providers'] if r['key'] == 'example']
-        assert len(provider) == 1
-        provider = provider[0]
-        assert provider['name'] == 'Example'
-        assert provider['setupDialog']['url']
+        with self.feature("organizations:integrations-feature-flag-integration"):
+            response = self.get_success_response(self.organization.slug)
+            provider = [
+                r for r in response.data["providers"] if r["key"] == "feature_flag_integration"
+            ]
+            assert len(provider) == 1

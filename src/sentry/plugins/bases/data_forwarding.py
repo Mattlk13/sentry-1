@@ -1,15 +1,18 @@
-from __future__ import absolute_import
+import logging
+from collections.abc import MutableMapping
+from typing import Any
 
-from sentry import tsdb, ratelimits
+from sentry import ratelimits, tsdb
 from sentry.api.serializers import serialize
+from sentry.eventstore.models import Event
 from sentry.plugins.base import Plugin
 from sentry.plugins.base.configuration import react_plugin_config
-from sentry.plugins.status import PluginStatus
+from sentry.tsdb.base import TSDBModel
+
+logger = logging.getLogger(__name__)
 
 
 class DataForwardingPlugin(Plugin):
-    status = PluginStatus.BETA
-
     def configure(self, project, request):
         return react_plugin_config(self, project, request)
 
@@ -17,29 +20,47 @@ class DataForwardingPlugin(Plugin):
         return True
 
     def get_rate_limit(self):
-        # number of requests, number of seconds (window)
+        """
+        Returns a tuple of (Number of Requests, Window in Seconds)
+        """
         return (50, 1)
 
-    def forward_event(self, payload):
-        """
-        Forward the event and return a boolean if it was successful.
-        """
+    def forward_event(self, event: Event, payload: MutableMapping[str, Any]) -> bool:
+        """Forward the event and return a boolean if it was successful."""
         raise NotImplementedError
 
     def get_event_payload(self, event):
         return serialize(event)
 
     def get_plugin_type(self):
-        return 'data-forwarding'
+        return "data-forwarding"
 
-    def post_process(self, event, **kwargs):
-        rl_key = u'{}:{}'.format(
-            self.conf_key,
-            event.project.organization_id,
-        )
+    def get_rl_key(self, event):
+        return f"{self.conf_key}:{event.project.organization_id}"
+
+    def initialize_variables(self, event):
+        return
+
+    def is_ratelimited(self, event):
+        self.initialize_variables(event)
+        rl_key = self.get_rl_key(event)
         # limit segment to 50 requests/second
         limit, window = self.get_rate_limit()
-        if limit and window and ratelimits.is_limited(rl_key, limit=limit, window=window):
+        if limit and window and ratelimits.backend.is_limited(rl_key, limit=limit, window=window):
+            logger.info(
+                "data_forwarding.skip_rate_limited",
+                extra={
+                    "event_id": event.event_id,
+                    "issue_id": event.group_id,
+                    "project_id": event.project_id,
+                    "organization_id": event.project.organization_id,
+                },
+            )
+            return True
+        return False
+
+    def post_process(self, event, **kwargs):
+        if self.is_ratelimited(event):
             return
 
         payload = self.get_event_payload(event)
@@ -47,4 +68,4 @@ class DataForwardingPlugin(Plugin):
         if success is False:
             # TODO(dcramer): record failure
             pass
-        tsdb.incr(tsdb.models.project_total_forwarded, event.project.id, count=1)
+        tsdb.incr(TSDBModel.project_total_forwarded, event.project.id, count=1)

@@ -1,25 +1,39 @@
-# -*- coding: utf-8 -*-
-
-from __future__ import absolute_import
-
-from sentry.api.serializers import serialize, Serializer
-from sentry.testutils import TestCase
+from sentry.api.serializers import Serializer, serialize
+from sentry.testutils.cases import TestCase
+from sentry.testutils.silo import control_silo_test
 
 
-class Foo(object):
+class Foo:
     pass
 
 
 class FooSerializer(Serializer):
     def serialize(self, *args, **kwargs):
-        return 'lol'
+        return "lol"
 
 
 class VariadicSerializer(Serializer):
-    def serialize(self, obj, attrs, user, kw):
-        return {'kw': kw}
+    def serialize(self, obj, attrs, user, **kw):
+        return {"kw": kw}
 
 
+class FailingChildSerializer(Serializer):
+    def serialize(self, obj, attrs, user, **kwargs):
+        raise Exception
+
+
+class ParentSerializer(Serializer):
+    def get_attrs(self, item_list, user, **kwargs):
+        return {item: {"child_data": Foo()} for item in item_list}
+
+    def serialize(self, obj, attrs, user, **kwargs):
+        return {
+            "parent": "something",
+            "child": serialize(attrs["child_data"], serializer=FailingChildSerializer()),
+        }
+
+
+@control_silo_test
 class BaseSerializerTest(TestCase):
     def test_serialize(self):
         assert serialize([]) == []
@@ -31,11 +45,11 @@ class BaseSerializerTest(TestCase):
 
         # explicitly passed serializer
         foo_serializer = FooSerializer()
-        assert serialize(user, serializer=foo_serializer) == 'lol'
+        assert serialize(user, serializer=foo_serializer) == "lol"
 
         foo = Foo()
-        assert serialize(foo) is foo, 'should return the object when unknown'
-        assert serialize(foo, serializer=foo_serializer) == 'lol'
+        assert serialize(foo) is foo, "should return the object when unknown"
+        assert serialize(foo, serializer=foo_serializer) == "lol"
 
         rv = serialize([user])
         assert isinstance(rv, list)
@@ -55,5 +69,12 @@ class BaseSerializerTest(TestCase):
     def test_serialize_additional_kwargs(self):
         foo = Foo()
         user = self.create_user()
-        result = serialize(foo, user, VariadicSerializer(), kw='keyword')
-        assert result['kw'] == 'keyword'
+        result = serialize(foo, user, VariadicSerializer(), kw="keyword")
+        assert result["kw"] == {"kw": "keyword"}
+
+    def test_child_serializer_failure(self):
+        foo = Foo()
+
+        result = serialize(foo, serializer=ParentSerializer())
+        assert result["parent"] == "something"
+        assert result["child"] is None

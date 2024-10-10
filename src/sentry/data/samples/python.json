@@ -4,7 +4,7 @@
     ["server_name", "web01.example.org"],
     ["environment", "prod"]
   ],
-  "sentry.interfaces.Stacktrace": {
+  "stacktrace": {
     "frames": [
       {
         "function": "build_msg",
@@ -22,19 +22,13 @@
           "'event_type'": "'raven.events.Message'",
           "'date'": "datetime.datetime(2013, 8, 13, 3, 8, 24, 880386)",
           "'extra'": {
-            "'loadavg'": [
-              0.37255859375,
-              0.5341796875,
-              0.62939453125
-            ],
+            "'loadavg'": [0.37255859375, 0.5341796875, 0.62939453125],
             "'user'": "'dcramer'",
             "'go_deeper'": [
               [
                 {
                   "'foo'": "'bar'",
-                  "'bar'": [
-                    "'baz'"
-                  ]
+                  "'bar'": ["'baz'"]
                 }
               ]
             ]
@@ -99,19 +93,13 @@
           "'event_type'": "'raven.events.Message'",
           "'date'": null,
           "'extra'": {
-            "'loadavg'": [
-              0.37255859375,
-              0.5341796875,
-              0.62939453125
-            ],
+            "'loadavg'": [0.37255859375, 0.5341796875, 0.62939453125],
             "'user'": "'dcramer'",
             "'go_deeper'": [
               [
                 {
                   "'foo'": "'bar'",
-                  "'bar'": [
-                    "'baz'"
-                  ]
+                  "'bar'": ["'baz'"]
                 }
               ]
             ]
@@ -155,19 +143,13 @@
           "'message'": "'This is a test message generated using ``raven test``'",
           "'kwargs'": {
             "'extra'": {
-              "'loadavg'": [
-                0.37255859375,
-                0.5341796875,
-                0.62939453125
-              ],
+              "'loadavg'": [0.37255859375, 0.5341796875, 0.62939453125],
               "'user'": "'dcramer'",
               "'go_deeper'": [
                 [
                   {
                     "'foo'": "'bar'",
-                    "'bar'": [
-                      "'baz'"
-                    ]
+                    "'bar'": ["'baz'"]
                   }
                 ]
               ]
@@ -259,21 +241,5 @@
         "lineno": 112
       }
     ]
-  },
-  "sentry.interfaces.Template": {
-    "abs_path": "/srv/example/templates/debug_toolbar/base.html",
-    "pre_context": [
-      "{% endif %}\n",
-      "<script src=\"{% static 'debug_toolbar/js/toolbar.js' %}\"></script>\n",
-      "<div id=\"djDebug\" hidden=\"hidden\" dir=\"ltr\"\n"
-    ],
-    "post_context": [
-      "     {{ toolbar.config.ROOT_TAG_EXTRA_ATTRS|safe }}>\n",
-      "\t<div hidden=\"hidden\" id=\"djDebugToolbar\">\n",
-      "\t\t<ul id=\"djDebugPanelList\">\n"
-    ],
-    "filename": "debug_toolbar/base.html",
-    "lineno": 14,
-    "context_line": "     data-store-id=\"{{ toolbar.store_id }}\" data-render-panel-url=\"{% url 'djdt:render_panel' %}\"\n"
   }
 }

@@ -1,26 +1,40 @@
-from __future__ import absolute_import
-
-from django.conf import settings
-
 from sentry import options
 from sentry.utils.services import LazyServiceWrapper
 
-from .base import Analytics  # NOQA
+from .attribute import Attribute
+from .base import Analytics
+from .event import Event
 from .event_manager import default_manager
-from .event import *  # NOQA
+from .map import Map
+
+__all__ = (
+    "Analytics",
+    "Attribute",
+    "Event",
+    "Map",
+    "record",
+    "record_event",
+    "setup",
+)
+
+_SENTRY_ANALYTICS_ALIASES = {
+    "noop": "sentry.analytics.Analytics",
+    "pubsub": "sentry.analytics.pubsub.PubSubAnalytics",
+}
 
 
-def get_backend_path(backend):
-    try:
-        backend = settings.SENTRY_ANALYTICS_ALIASES[backend]
-    except KeyError:
-        pass
-    return backend
+def _get_backend_path(path: str) -> str:
+    return _SENTRY_ANALYTICS_ALIASES.get(path, path)
 
 
 backend = LazyServiceWrapper(
-    Analytics, get_backend_path(options.get('analytics.backend')), options.get('analytics.options')
+    backend_base=Analytics,
+    backend_path=_get_backend_path(options.get("analytics.backend")),
+    options=options.get("analytics.options"),
 )
-backend.expose(locals())
 
+record = backend.record
+record_event = backend.record_event
 register = default_manager.register
+setup = backend.setup
+validate = backend.validate

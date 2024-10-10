@@ -1,57 +1,74 @@
-from __future__ import absolute_import
-
-from datetime import timedelta
-
-from django.core.urlresolvers import reverse
-from django.utils import timezone
-
-from sentry.testutils import (
-    APITestCase,
-    SnubaTestCase,
-)
+from sentry.constants import DS_DENYLIST
+from sentry.testutils.cases import APITestCase, SnubaTestCase
+from sentry.testutils.helpers.datetime import before_now, iso_format
 
 
 class ProjectTagsTest(APITestCase, SnubaTestCase):
+    endpoint = "sentry-api-0-project-tags"
+
     def setUp(self):
-        super(ProjectTagsTest, self).setUp()
-        self.min_ago = timezone.now() - timedelta(minutes=1)
+        super().setUp()
+        self.login_as(user=self.user)
 
     def test_simple(self):
-        user = self.create_user()
-        org = self.create_organization()
-        team = self.create_team(organization=org)
-        self.create_member(organization=org, user=user, teams=[team])
-
-        project = self.create_project(organization=org, teams=[team])
-        group = self.create_group(project=project)
-        self.create_event(
-            event_id='a' * 32,
-            group=group,
-            datetime=self.min_ago,
-            tags={'foo': 'oof', 'bar': 'rab'},
+        self.store_event(
+            data={
+                "tags": {"foo": "oof", "bar": "rab"},
+                "timestamp": iso_format(before_now(minutes=1)),
+            },
+            project_id=self.project.id,
         )
-        self.create_event(
-            event_id='b' * 32,
-            group=group,
-            datetime=self.min_ago,
-            tags={'bar': 'rab2'},
+        self.store_event(
+            data={"tags": {"bar": "rab2"}, "timestamp": iso_format(before_now(minutes=1))},
+            project_id=self.project.id,
         )
 
-        self.login_as(user=user)
+        response = self.get_success_response(self.project.organization.slug, self.project.slug)
 
-        url = reverse(
-            'sentry-api-0-project-tags',
-            kwargs={
-                'organization_slug': project.organization.slug,
-                'project_slug': project.slug,
-            }
+        data = {v["key"]: v for v in response.data}
+        assert len(data) == 3
+
+        assert data["foo"]["canDelete"]
+        assert data["foo"]["uniqueValues"] == 1
+        assert data["bar"]["canDelete"]
+        assert data["bar"]["uniqueValues"] == 2
+
+    def test_simple_remove_tags_in_denylist(self):
+        self.store_event(
+            data={
+                # "browser" and "sentry:dist" are in denylist sentry.constants.DS_DENYLIST
+                "tags": {"browser": "chrome", "bar": "rab", "sentry:dist": "test_dist"},
+                "timestamp": iso_format(before_now(minutes=1)),
+            },
+            project_id=self.project.id,
         )
-        response = self.client.get(url, format='json')
-        assert response.status_code == 200, response.content
-        data = {v['key']: v for v in response.data}
-        assert len(data) == 2
+        self.store_event(
+            data={"tags": {"bar": "rab2"}, "timestamp": iso_format(before_now(minutes=1))},
+            project_id=self.project.id,
+        )
 
-        assert data['foo']['canDelete']
-        assert data['foo']['uniqueValues'] == 1
-        assert data['bar']['canDelete']
-        assert data['bar']['uniqueValues'] == 2
+        response = self.get_success_response(
+            self.project.organization.slug, self.project.slug, onlySamplingTags=1
+        )
+
+        data = {v["key"]: v for v in response.data}
+        assert len(data) == 1
+
+        assert data["bar"]["canDelete"]
+        assert data["bar"]["uniqueValues"] == 2
+
+    def test_simple_remove_tags_in_denylist_remove_all_tags(self):
+        self.store_event(
+            data={
+                "tags": {deny_tag: "value_{deny_tag}" for deny_tag in DS_DENYLIST},
+                "timestamp": iso_format(before_now(minutes=1)),
+            },
+            project_id=self.project.id,
+        )
+        response = self.get_success_response(
+            self.project.organization.slug, self.project.slug, onlySamplingTags=1
+        )
+
+        data = {v["key"]: v for v in response.data}
+        assert len(data) == 0
+        assert data == {}

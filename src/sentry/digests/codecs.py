@@ -1,21 +1,19 @@
-from __future__ import absolute_import
-
+import pickle
 import zlib
+from typing import Any
 
-from sentry.utils.compat import pickle
 
-
-class Codec(object):
-    def encode(self, value):
+class Codec:
+    def encode(self, value: Any) -> bytes:
         raise NotImplementedError
 
-    def decode(self, value):
+    def decode(self, value: bytes) -> Any:
         raise NotImplementedError
 
 
 class CompressedPickleCodec(Codec):
-    def encode(self, value):
+    def encode(self, value: Any) -> bytes:
         return zlib.compress(pickle.dumps(value))
 
-    def decode(self, value):
+    def decode(self, value: bytes) -> Any:
         return pickle.loads(zlib.decompress(value))

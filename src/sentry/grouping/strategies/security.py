@@ -1,82 +1,78 @@
-from __future__ import absolute_import
+from typing import Any
 
+from sentry.eventstore.models import Event
 from sentry.grouping.component import GroupingComponent
-from sentry.grouping.strategies.base import strategy
-
-
-def _security_v1(reported_id, obj):
-    return GroupingComponent(
-        id=reported_id,
-        values=[
-            GroupingComponent(id='salt', values=[reported_id]),
-            GroupingComponent(id='hostname', values=[obj.hostname]),
-        ]
-    )
-
-
-@strategy(
-    id='expect-ct:v1',
-    interfaces=['expectct'],
-    variants=['default'],
-    score=1000,
+from sentry.grouping.strategies.base import (
+    GroupingContext,
+    ReturnedVariants,
+    produces_variants,
+    strategy,
 )
-def expect_ct_v1(expectct_interface, **meta):
-    return _security_v1('expect-ct', expectct_interface)
+from sentry.interfaces.security import Csp, ExpectCT, ExpectStaple, Hpkp, SecurityReport
 
 
-@strategy(
-    id='expect-staple:v1',
-    interfaces=['expectstaple'],
-    variants=['default'],
-    score=1001,
-)
-def expect_staple_v1(expectstaple_interface, **meta):
-    return _security_v1('expect-staple', expectstaple_interface)
-
-
-@strategy(
-    id='hpkp:v1',
-    interfaces=['hpkp'],
-    variants=['default'],
-    score=1002,
-)
-def hpkp_v1(hpkp_interface, **meta):
-    return _security_v1('hpkp', hpkp_interface)
-
-
-@strategy(
-    id='csp:v1',
-    interfaces=['csp'],
-    variants=['default'],
-    score=1003,
-)
-def csp_v1(csp_interface, **meta):
-    violation_component = GroupingComponent(id='violation')
-    uri_component = GroupingComponent(id='uri')
-
-    if csp_interface.local_script_violation_type:
-        violation_component.update(
-            values=["'%s'" % csp_interface.local_script_violation_type],
+def _security_v1(
+    reported_id: str, obj: SecurityReport, context: GroupingContext, **meta: Any
+) -> ReturnedVariants:
+    return {
+        context["variant"]: GroupingComponent(
+            id=reported_id,
+            values=[
+                GroupingComponent(id="salt", values=[reported_id]),
+                GroupingComponent(id="hostname", values=[obj.hostname]),
+            ],
         )
+    }
+
+
+@strategy(ids=["expect-ct:v1"], interface=ExpectCT, score=1000)
+@produces_variants(["default"])
+def expect_ct_v1(
+    interface: ExpectCT, event: Event, context: GroupingContext, **meta: Any
+) -> ReturnedVariants:
+    return _security_v1("expect-ct", interface, context=context, **meta)
+
+
+@strategy(ids=["expect-staple:v1"], interface=ExpectStaple, score=1001)
+@produces_variants(["default"])
+def expect_staple_v1(
+    interface: ExpectStaple, event: Event, context: GroupingContext, **meta: Any
+) -> ReturnedVariants:
+    return _security_v1("expect-staple", interface, context=context, **meta)
+
+
+@strategy(ids=["hpkp:v1"], interface=Hpkp, score=1002)
+@produces_variants(["default"])
+def hpkp_v1(
+    interface: Hpkp, event: Event, context: GroupingContext, **meta: Any
+) -> ReturnedVariants:
+    return _security_v1("hpkp", interface, context=context, **meta)
+
+
+@strategy(ids=["csp:v1"], interface=Csp, score=1003)
+@produces_variants(["default"])
+def csp_v1(interface: Csp, event: Event, context: GroupingContext, **meta: Any) -> ReturnedVariants:
+    violation_component = GroupingComponent(id="violation")
+    uri_component = GroupingComponent(id="uri")
+
+    if interface.local_script_violation_type:
+        violation_component.update(values=["'%s'" % interface.local_script_violation_type])
         uri_component.update(
             contributes=False,
-            hint='violation takes precedence',
-            values=[csp_interface.normalized_blocked_uri],
+            hint="violation takes precedence",
+            values=[interface.normalized_blocked_uri],
         )
     else:
-        violation_component.update(
-            contributes=False,
-            hint='not a local script violation',
-        )
-        uri_component.update(
-            values=[csp_interface.normalized_blocked_uri]
-        )
+        violation_component.update(contributes=False, hint="not a local script violation")
+        uri_component.update(values=[interface.normalized_blocked_uri])
 
-    return GroupingComponent(
-        id='csp',
-        values=[
-            GroupingComponent(id='salt', values=[csp_interface.effective_directive]),
-            violation_component,
-            uri_component,
-        ],
-    )
+    return {
+        context["variant"]: GroupingComponent(
+            id="csp",
+            values=[
+                GroupingComponent(id="salt", values=[interface.effective_directive]),
+                violation_component,
+                uri_component,
+            ],
+        )
+    }

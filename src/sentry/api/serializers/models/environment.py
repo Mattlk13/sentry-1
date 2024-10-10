@@ -1,42 +1,50 @@
-from __future__ import absolute_import
-
-import six
-
 from collections import namedtuple
 from datetime import timedelta
+from typing import TypedDict
+
 from django.utils import timezone
 
-from sentry.app import tsdb
+from sentry import tsdb
 from sentry.api.serializers import Serializer, register
-from sentry.models import Environment, EnvironmentProject
+from sentry.models.environment import Environment, EnvironmentProject
+from sentry.tsdb.base import TSDBModel
+
+StatsPeriod = namedtuple("StatsPeriod", ("segments", "interval"))
 
 
-StatsPeriod = namedtuple('StatsPeriod', ('segments', 'interval'))
+class EnvironmentSerializerResponse(TypedDict):
+    id: str
+    name: str
+
+
+class EnvironmentProjectSerializerResponse(TypedDict):
+    id: str
+    name: str
+    isHidden: bool
 
 
 @register(Environment)
 class EnvironmentSerializer(Serializer):
-    def serialize(self, obj, attrs, user):
-        return {
-            'id': six.text_type(obj.id),
-            'name': obj.name,
-        }
+    def serialize(self, obj: Environment, attrs, user, **kwargs) -> EnvironmentSerializerResponse:
+        return {"id": str(obj.id), "name": obj.name}
 
 
 @register(EnvironmentProject)
 class EnvironmentProjectSerializer(Serializer):
-    def serialize(self, obj, attrs, user):
+    def serialize(
+        self, obj: EnvironmentProject, attrs, user, **kwargs
+    ) -> EnvironmentProjectSerializerResponse:
         return {
-            'id': six.text_type(obj.id),
-            'name': obj.environment.name,
-            'isHidden': obj.is_hidden is True,
+            "id": str(obj.id),
+            "name": obj.environment.name,
+            "isHidden": obj.is_hidden is True,
         }
 
 
 class GroupEnvironmentWithStatsSerializer(EnvironmentSerializer):
     STATS_PERIODS = {
-        '24h': StatsPeriod(24, timedelta(hours=1)),
-        '30d': StatsPeriod(30, timedelta(hours=24)),
+        "24h": StatsPeriod(24, timedelta(hours=1)),
+        "30d": StatsPeriod(30, timedelta(hours=24)),
     }
 
     def __init__(self, group, since=None, until=None):
@@ -44,19 +52,19 @@ class GroupEnvironmentWithStatsSerializer(EnvironmentSerializer):
         self.since = since
         self.until = until
 
-    def get_attrs(self, item_list, user):
-        attrs = {item: {'stats': {}} for item in item_list}
+    def get_attrs(self, item_list, user, **kwargs):
+        attrs = {item: {"stats": {}} for item in item_list}
         items = {self.group.id: []}
         for item in item_list:
             items[self.group.id].append(item.id)
 
-        for key, (segments, interval) in six.iteritems(self.STATS_PERIODS):
+        for key, (segments, interval) in self.STATS_PERIODS.items():
             until = self.until or timezone.now()
             since = self.since or until - (segments * interval)
 
             try:
                 stats = tsdb.get_frequency_series(
-                    model=tsdb.models.frequent_environments_by_group,
+                    model=TSDBModel.frequent_environments_by_group,
                     items=items,
                     start=since,
                     end=until,
@@ -68,12 +76,12 @@ class GroupEnvironmentWithStatsSerializer(EnvironmentSerializer):
                 stats = {}
 
             for item in item_list:
-                attrs[item]['stats'][key] = [
+                attrs[item]["stats"][key] = [
                     (k, v[item.id]) for k, v in stats.get(self.group.id, {})
                 ]
         return attrs
 
-    def serialize(self, obj, attrs, user):
-        result = super(GroupEnvironmentWithStatsSerializer, self).serialize(obj, attrs, user)
-        result['stats'] = attrs['stats']
+    def serialize(self, obj, attrs, user, **kwargs):
+        result = super().serialize(obj, attrs, user)
+        result["stats"] = attrs["stats"]
         return result

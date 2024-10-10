@@ -1,81 +1,93 @@
-from __future__ import absolute_import
+from __future__ import annotations
+
+from collections.abc import Sequence
 
 from rest_framework import serializers
 
-from sentry.api.fields.actor import Actor
-from sentry.models import (
-    Team,
-    User,
-)
+from sentry.models.organizationmember import OrganizationMember
+from sentry.models.organizationmemberteam import OrganizationMemberTeam
+from sentry.models.team import Team
+from sentry.silo.base import region_silo_function
+from sentry.types.actor import Actor
+from sentry.users.services.user import RpcUser
 
 
+@region_silo_function
 def extract_user_ids_from_mentions(organization_id, mentions):
     """
     Extracts user ids from a set of mentions. Mentions should be a list of
-    `Actor` instances. Returns a dictionary with 'users' and 'team_users' keys.
-    'users' is the user ids for all explicitly mentioned users, and 'team_users'
+    `Actor` instances. Returns a dictionary with 'users', 'team_users', and 'teams' keys.
+    'users' is the user ids for all explicitly mentioned users, 'team_users'
     is all user ids from explicitly mentioned teams, excluding any already
-    mentioned users.
+    mentioned users, and 'teams' is the team ids for all explicitly mentioned teams.
     """
-    actors = Actor.resolve_many(mentions)
-    actor_mentions = seperate_resolved_actors(actors)
+    actors: Sequence[RpcUser | Team] = Actor.resolve_many(mentions)
+    actor_mentions = separate_resolved_actors(actors)
 
-    mentioned_team_users = list(
-        User.objects.get_from_teams(
-            organization_id,
-            actor_mentions['teams'],
-        ).exclude(id__in={u.id for u in actor_mentions['users']}).values_list(
-            'id',
-            flat=True,
-        )
+    team_user_ids = set(
+        OrganizationMemberTeam.objects.filter(
+            team_id__in=[t.id for t in actor_mentions["teams"]],
+            organizationmember__user_id__isnull=False,
+            organizationmember__user_is_active=True,
+            organizationmember__organization_id=organization_id,
+            is_active=True,
+        ).values_list("organizationmember__user_id", flat=True)
     )
+    mentioned_team_users = team_user_ids - set({u.id for u in actor_mentions["users"]})
 
     return {
-        'users': set([user.id for user in actor_mentions['users']]),
-        'team_users': set(mentioned_team_users),
+        "users": {user.id for user in actor_mentions["users"]},
+        "team_users": set(mentioned_team_users),
+        "teams": {team.id for team in actor_mentions["teams"]},
     }
 
 
-def seperate_actors(actors):
-    users = [actor for actor in actors if actor.type is User]
-    teams = [actor for actor in actors if actor.type is Team]
+def separate_actors(actors: Sequence[Actor]):
+    users = [actor for actor in actors if actor.is_user]
+    teams = [actor for actor in actors if actor.is_team]
 
-    return {'users': users, 'teams': teams}
+    return {"users": users, "teams": teams}
 
 
-def seperate_resolved_actors(actors):
-    users = [actor for actor in actors if isinstance(actor, User)]
+def separate_resolved_actors(actors: Sequence[RpcUser | Team]):
+    users = [actor for actor in actors if actor.class_name() == "User"]
     teams = [actor for actor in actors if isinstance(actor, Team)]
 
-    return {'users': users, 'teams': teams}
+    return {"users": users, "teams": teams}
 
 
-class MentionsMixin(object):
+class MentionsMixin:
     def validate_mentions(self, mentions):
-        if mentions and 'projects' in self.context:
+        if mentions and "projects" in self.context:
 
-            seperated_actors = seperate_actors(mentions)
+            separated_actors = separate_actors(mentions)
             # Validate that all mentioned users exist and are on the project.
-            users = seperated_actors['users']
+            users = separated_actors["users"]
 
             mentioned_user_ids = {user.id for user in users}
 
-            projects = self.context['projects']
-            organization_id = self.context['organization_id']
-            users = User.objects.get_from_projects(organization_id, projects)
-            user_ids = users.filter(id__in=mentioned_user_ids).values_list('id', flat=True)
+            projects = self.context["projects"]
+            user_ids = list(
+                OrganizationMember.objects.filter(
+                    teams__projectteam__project__in=[p.id for p in projects],
+                    user_id__in=mentioned_user_ids,
+                ).values_list("user_id", flat=True)
+            )
 
             if len(mentioned_user_ids) > len(user_ids):
-                raise serializers.ValidationError('Cannot mention a non team member')
+                raise serializers.ValidationError("Cannot mention a non team member")
 
             # Validate that all mentioned teams exist and are on the project.
-            teams = seperated_actors['teams']
+            teams = separated_actors["teams"]
             mentioned_team_ids = {team.id for team in teams}
-            if len(mentioned_team_ids) > Team.objects.filter(
-                id__in=mentioned_team_ids,
-                projectteam__project__in=projects,
-            ).count():
+            if (
+                len(mentioned_team_ids)
+                > Team.objects.filter(
+                    id__in=mentioned_team_ids, projectteam__project__in=projects
+                ).count()
+            ):
                 raise serializers.ValidationError(
-                    'Mentioned team not found or not associated with project')
+                    "Mentioned team not found or not associated with project"
+                )
 
         return mentions

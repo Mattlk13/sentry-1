@@ -1,19 +1,12 @@
-from __future__ import absolute_import
-
-import six
-
-from django.forms.widgets import RadioFieldRenderer, TextInput, Widget
-from django.forms.util import flatatt
-from django.forms import (
-    Field, CharField, EmailField, TypedChoiceField, ValidationError
-)
-from django.utils.encoding import force_text
+from django.forms import CharField, EmailField, Field, TypedChoiceField, ValidationError
+from django.forms.utils import flatatt
+from django.forms.widgets import TextInput, Widget
 from django.utils.html import format_html
 from django.utils.safestring import mark_safe
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 
-from sentry.models import User
-from sentry.security import is_valid_email_address
+from sentry.users.models.user import User
+from sentry.utils.email.address import is_valid_email_address
 
 
 class CustomTypedChoiceField(TypedChoiceField):
@@ -24,57 +17,39 @@ class CustomTypedChoiceField(TypedChoiceField):
         """
         Validates that the input is in self.choices.
         """
-        super(CustomTypedChoiceField, self).validate(value)
+        super().validate(value)
         # this will validate itself twice due to the internal ChoiceField
         # validation
         if value is not None and not self.valid_value(value):
             raise ValidationError(
-                self.error_messages['invalid_choice'],
-                code='invalid_choice',
-                params={'value': value},
+                self.error_messages["invalid_choice"],
+                code="invalid_choice",
+                params={"value": value},
             )
-
-
-class RadioFieldRenderer(RadioFieldRenderer):
-    """
-    This is identical to Django's builtin widget, except that
-    it renders as a Bootstrap2 compatible widget. Would be great if
-    we didn't have to create this stupid code, but Django widgets are not
-    flexible.
-    """
-
-    def render(self):
-        return mark_safe(
-            u'\n<div class="inputs-list">%s</div>\n' % u'\n'.join([force_text(w) for w in self])
-        )
 
 
 class UserField(CharField):
     class widget(TextInput):
-        def render(self, name, value, attrs=None):
+        def render(self, name, value, attrs=None, renderer=None):
             if not attrs:
                 attrs = {}
-            if 'placeholder' not in attrs:
-                attrs['placeholder'] = 'username'
-            if isinstance(value, six.integer_types):
+            attrs.setdefault("placeholder", "username")
+            if isinstance(value, int):
                 value = User.objects.get(id=value).username
-            return super(UserField.widget, self).render(name, value, attrs)
+            return super().render(name, value, attrs=attrs, renderer=renderer)
 
     def clean(self, value):
-        value = super(UserField, self).clean(value)
+        value = super().clean(value)
         if not value:
             return None
         try:
-            return User.objects.get(
-                username=value,
-                is_active=True,
-            )
+            return User.objects.get(username=value, is_active=True)
         except User.DoesNotExist:
-            raise ValidationError(_('Invalid username'))
+            raise ValidationError(_("Invalid username"))
 
 
 class ReadOnlyTextWidget(Widget):
-    def render(self, name, value, attrs):
+    def render(self, name, value, attrs=None, renderer=None):
         final_attrs = self.build_attrs(attrs)
         if not value:
             value = mark_safe("<em>%s</em>" % _("Not set"))
@@ -86,7 +61,7 @@ class ReadOnlyTextField(Field):
 
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("required", False)
-        super(ReadOnlyTextField, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
     def bound_data(self, data, initial):
         # Always return initial because the widget doesn't
@@ -96,7 +71,7 @@ class ReadOnlyTextField(Field):
 
 def email_address_validator(value):
     if not is_valid_email_address(value):
-        raise ValidationError(_('Enter a valid email address.'), code='invalid')
+        raise ValidationError(_("Enter a valid email address."), code="invalid")
     return value
 
 

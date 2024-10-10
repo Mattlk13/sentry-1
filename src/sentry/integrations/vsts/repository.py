@@ -1,82 +1,79 @@
-from __future__ import absolute_import
+from __future__ import annotations
 
-import six
+import logging
+from collections.abc import Mapping, MutableMapping, Sequence
+from typing import Any
 
-from sentry.plugins import providers
-from sentry.models import Integration
-from sentry.integrations.exceptions import IntegrationError
+from sentry.models.commit import Commit
+from sentry.models.organization import Organization
+from sentry.models.repository import Repository
+from sentry.organizations.services.organization.model import RpcOrganization
+from sentry.plugins.providers import IntegrationRepositoryProvider
 
 MAX_COMMIT_DATA_REQUESTS = 90
 
+logger = logging.getLogger(__name__)
 
-class VstsRepositoryProvider(providers.IntegrationRepositoryProvider):
-    name = 'Azure DevOps'
 
-    def get_installation(self, integration_id, organization_id):
-        if integration_id is None:
-            raise IntegrationError('%s requires an integration id.' % self.name)
+class VstsRepositoryProvider(IntegrationRepositoryProvider):
+    name = "Azure DevOps"
+    repo_provider = "vsts"
 
-        integration_model = Integration.objects.get(
-            id=integration_id,
-            organizations=organization_id,
-            provider='vsts',
-        )
-
-        return integration_model.get_installation(organization_id)
-
-    def get_repository_data(self, organization, config):
-        installation = self.get_installation(config.get('installation'), organization.id)
+    def get_repository_data(
+        self, organization: Organization, config: MutableMapping[str, Any]
+    ) -> Mapping[str, str]:
+        installation = self.get_installation(config.get("installation"), organization.id)
         client = installation.get_client()
-        instance = installation.instance
 
-        repo_id = config['identifier']
+        repo_id = config["identifier"]
 
         try:
-            repo = client.get_repo(instance, repo_id)
+            repo = client.get_repo(repo_id)
         except Exception as e:
-            installation.raise_error(e)
-        config.update({
-            'instance': instance,
-            'project': repo['project']['name'],
-            'name': repo['name'],
-            'external_id': six.text_type(repo['id']),
-            'url': repo['_links']['web']['href'],
-        })
+            raise installation.raise_error(e)
+        config.update(
+            {
+                "instance": installation.instance,
+                "project": repo["project"]["name"],
+                "name": repo["name"],
+                "external_id": str(repo["id"]),
+                "url": repo["_links"]["web"]["href"],
+            }
+        )
         return config
 
-    def build_repository_config(self, organization, data):
+    def build_repository_config(
+        self, organization: RpcOrganization, data: Mapping[str, str]
+    ) -> Mapping[str, Any]:
         return {
-            'name': data['name'],
-            'external_id': data['external_id'],
-            'url': data['url'],
-            'config': {
-                'instance': data['instance'],
-                'project': data['project'],
-                'name': data['name'],
+            "name": data["name"],
+            "external_id": data["external_id"],
+            "url": data["url"],
+            "config": {
+                "instance": data["instance"],
+                "project": data["project"],
+                "name": data["name"],
             },
-            'integration_id': data['installation'],
+            "integration_id": data["installation"],
         }
 
-    def transform_changes(self, patch_set):
-        type_mapping = {
-            'add': 'A',
-            'delete': 'D',
-            'edit': 'M',
-        }
+    def transform_changes(
+        self, patch_set: Sequence[Mapping[str, Any]]
+    ) -> Sequence[Mapping[str, str]]:
+        type_mapping = {"add": "A", "delete": "D", "edit": "M"}
         file_changes = []
         # https://docs.microsoft.com/en-us/rest/api/vsts/git/commits/get%20changes#versioncontrolchangetype
         for change in patch_set:
-            change_type = type_mapping.get(change['changeType'])
+            change_type = type_mapping.get(change["changeType"])
 
-            if change_type and change.get('item') and change['item']['gitObjectType'] == 'blob':
-                file_changes.append({
-                    'path': change['item']['path'],
-                    'type': change_type
-                })
+            if change_type and change.get("item") and change["item"]["gitObjectType"] == "blob":
+                file_changes.append({"path": change["item"]["path"], "type": change_type})
 
         return file_changes
 
-    def zip_commit_data(self, repo, commit_list, organization_id):
+    def zip_commit_data(
+        self, repo: Repository, commit_list: Sequence[Commit], organization_id: int
+    ) -> Sequence[Commit]:
         installation = self.get_installation(repo.integration_id, organization_id)
         client = installation.get_client()
         n = 0
@@ -85,18 +82,12 @@ class VstsRepositoryProvider(providers.IntegrationRepositoryProvider):
             # We need to make an additional API call to get the full commit message.
             # This is important because issue refs could be anywhere in the commit
             # message.
-            if commit.get('commentTruncated', False):
-                full_commit = client.get_commit(
-                    repo.config['instance'],
-                    repo.external_id,
-                    commit['commitId'])
-                commit['comment'] = full_commit['comment']
+            if commit.get("commentTruncated", False):
+                full_commit = client.get_commit(repo.external_id, commit["commitId"])
+                commit["comment"] = full_commit["comment"]
 
-            commit['patch_set'] = self.transform_changes(
-                client.get_commit_filechanges(
-                    repo.config['instance'],
-                    repo.external_id,
-                    commit['commitId'])
+            commit["patch_set"] = self.transform_changes(
+                client.get_commit_filechanges(repo.external_id, commit["commitId"])
             )
             # We only fetch patch data for 90 commits.
             n += 1
@@ -105,34 +96,39 @@ class VstsRepositoryProvider(providers.IntegrationRepositoryProvider):
 
         return commit_list
 
-    def compare_commits(self, repo, start_sha, end_sha):
+    def compare_commits(
+        self, repo: Repository, start_sha: str | None, end_sha: str
+    ) -> Sequence[Mapping[str, str]]:
+        """TODO(mgaeta): This function is kinda a mess."""
         installation = self.get_installation(repo.integration_id, repo.organization_id)
         client = installation.get_client()
-        instance = repo.config['instance']
 
         try:
             if start_sha is None:
-                res = client.get_commits(instance, repo.external_id, commit=end_sha, limit=10)
+                res = client.get_commits(repo.external_id, commit=end_sha, limit=10)
             else:
-                res = client.get_commit_range(instance, repo.external_id, start_sha, end_sha)
+                res = client.get_commit_range(repo.external_id, start_sha, end_sha)
         except Exception as e:
-            installation.raise_error(e)
+            raise installation.raise_error(e)
 
-        commits = self.zip_commit_data(repo, res['value'], repo.organization_id)
+        commits = self.zip_commit_data(repo, res["value"], repo.organization_id)
         return self._format_commits(repo, commits)
 
-    def _format_commits(self, repo, commit_list):
+    def _format_commits(
+        self, repo: Repository, commit_list: Sequence[Mapping[str, Any]]
+    ) -> Sequence[Mapping[str, Any]]:
         return [
             {
-                'id': c['commitId'],
-                'repository': repo.name,
-                'author_email': c['author']['email'],
-                'author_name': c['author']['name'],
-                'message': c['comment'],
-                'patch_set': c.get('patch_set'),
-                'timestamp': self.format_date(c['author']['date']),
-            } for c in commit_list
+                "id": c["commitId"],
+                "repository": repo.name,
+                "author_email": c["author"]["email"],
+                "author_name": c["author"]["name"],
+                "message": c["comment"],
+                "patch_set": c.get("patch_set"),
+                "timestamp": self.format_date(c["author"]["date"]),
+            }
+            for c in commit_list
         ]
 
-    def repository_external_slug(self, repo):
+    def repository_external_slug(self, repo: Repository) -> str:
         return repo.external_id

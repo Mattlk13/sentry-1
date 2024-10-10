@@ -1,9 +1,11 @@
-from __future__ import absolute_import
+import orjson
+from django.urls import reverse
 
-from django.core.urlresolvers import reverse
-import json
+from sentry.models.groupinbox import GroupInbox
+from sentry.testutils.cases import APITestCase
+from sentry.testutils.skips import requires_snuba
 
-from sentry.testutils import APITestCase
+pytestmark = [requires_snuba]
 
 
 class ProjectCreateSampleTest(APITestCase):
@@ -12,136 +14,151 @@ class ProjectCreateSampleTest(APITestCase):
         self.team = self.create_team()
 
     def test_simple(self):
-        project = self.create_project(teams=[self.team], name='foo')
+        project = self.create_project(teams=[self.team], name="foo")
 
         url = reverse(
-            'sentry-api-0-project-create-sample',
+            "sentry-api-0-project-create-sample",
             kwargs={
-                'organization_slug': project.organization.slug,
-                'project_slug': project.slug,
-            }
+                "organization_id_or_slug": project.organization.slug,
+                "project_id_or_slug": project.slug,
+            },
         )
-        response = self.client.post(url, format='json')
+        response = self.client.post(url, format="json")
 
         assert response.status_code == 200, response.content
-        assert 'groupID' in json.loads(response.content)
+        assert "groupID" in orjson.loads(response.content)
+        assert GroupInbox.objects.filter(group=response.data["groupID"]).exists()
 
     def test_project_platform(self):
-        project = self.create_project(teams=[self.team], name='foo', platform='javascript-react')
+        project = self.create_project(teams=[self.team], name="foo", platform="javascript-react")
 
         url = reverse(
-            'sentry-api-0-project-create-sample',
+            "sentry-api-0-project-create-sample",
             kwargs={
-                'organization_slug': project.organization.slug,
-                'project_slug': project.slug,
-            }
+                "organization_id_or_slug": project.organization.slug,
+                "project_id_or_slug": project.slug,
+            },
         )
-        response = self.client.post(url, format='json')
+        response = self.client.post(url, format="json")
 
         assert response.status_code == 200, response.content
-        assert 'groupID' in json.loads(response.content)
+        assert "groupID" in orjson.loads(response.content)
 
     def test_cocoa(self):
-        project = self.create_project(teams=[self.team], name='foo', platform='cocoa')
+        project = self.create_project(teams=[self.team], name="foo", platform="cocoa")
 
         url = reverse(
-            'sentry-api-0-project-create-sample',
+            "sentry-api-0-project-create-sample",
             kwargs={
-                'organization_slug': project.organization.slug,
-                'project_slug': project.slug,
-            }
+                "organization_id_or_slug": project.organization.slug,
+                "project_id_or_slug": project.slug,
+            },
         )
-        response = self.client.post(url, format='json')
+        response = self.client.post(url, format="json")
 
         assert response.status_code == 200, response.content
-        assert 'groupID' in json.loads(response.content)
+        assert "groupID" in orjson.loads(response.content)
 
     def test_java(self):
-        project = self.create_project(teams=[self.team], name='foo', platform='java')
+        project = self.create_project(teams=[self.team], name="foo", platform="java")
 
         url = reverse(
-            'sentry-api-0-project-create-sample',
+            "sentry-api-0-project-create-sample",
             kwargs={
-                'organization_slug': project.organization.slug,
-                'project_slug': project.slug,
-            }
+                "organization_id_or_slug": project.organization.slug,
+                "project_id_or_slug": project.slug,
+            },
         )
-        response = self.client.post(url, format='json')
+        response = self.client.post(url, format="json")
 
         assert response.status_code == 200, response.content
-        assert 'groupID' in json.loads(response.content)
+        assert "groupID" in orjson.loads(response.content)
 
     def test_javascript(self):
-        project = self.create_project(teams=[self.team], name='foo', platform='javascript')
+        project = self.create_project(teams=[self.team], name="foo", platform="javascript")
 
         url = reverse(
-            'sentry-api-0-project-create-sample',
+            "sentry-api-0-project-create-sample",
             kwargs={
-                'organization_slug': project.organization.slug,
-                'project_slug': project.slug,
-            }
+                "organization_id_or_slug": project.organization.slug,
+                "project_id_or_slug": project.slug,
+            },
         )
-        response = self.client.post(url, format='json')
+        response = self.client.post(url, format="json")
 
         assert response.status_code == 200, response.content
-        assert 'groupID' in json.loads(response.content)
+        assert "groupID" in orjson.loads(response.content)
 
     def test_php(self):
-        project = self.create_project(teams=[self.team], name='foo', platform='php')
+        project = self.create_project(teams=[self.team], name="foo", platform="php")
 
         url = reverse(
-            'sentry-api-0-project-create-sample',
+            "sentry-api-0-project-create-sample",
             kwargs={
-                'organization_slug': project.organization.slug,
-                'project_slug': project.slug,
-            }
+                "organization_id_or_slug": project.organization.slug,
+                "project_id_or_slug": project.slug,
+            },
         )
-        response = self.client.post(url, format='json')
+        response = self.client.post(url, format="json")
 
         assert response.status_code == 200, response.content
-        assert 'groupID' in json.loads(response.content)
+        assert "groupID" in orjson.loads(response.content)
 
     def test_python(self):
-        project = self.create_project(teams=[self.team], name='foo', platform='python')
+        project = self.create_project(teams=[self.team], name="foo", platform="python")
 
         url = reverse(
-            'sentry-api-0-project-create-sample',
+            "sentry-api-0-project-create-sample",
             kwargs={
-                'organization_slug': project.organization.slug,
-                'project_slug': project.slug,
-            }
+                "organization_id_or_slug": project.organization.slug,
+                "project_id_or_slug": project.slug,
+            },
         )
-        response = self.client.post(url, format='json')
+        response = self.client.post(url, format="json")
 
         assert response.status_code == 200, response.content
-        assert 'groupID' in json.loads(response.content)
+        assert "groupID" in orjson.loads(response.content)
 
     def test_reactnative(self):
-        project = self.create_project(teams=[self.team], name='foo', platform='react-native')
+        project = self.create_project(teams=[self.team], name="foo", platform="react-native")
 
         url = reverse(
-            'sentry-api-0-project-create-sample',
+            "sentry-api-0-project-create-sample",
             kwargs={
-                'organization_slug': project.organization.slug,
-                'project_slug': project.slug,
-            }
+                "organization_id_or_slug": project.organization.slug,
+                "project_id_or_slug": project.slug,
+            },
         )
-        response = self.client.post(url, format='json')
+        response = self.client.post(url, format="json")
 
         assert response.status_code == 200, response.content
-        assert 'groupID' in json.loads(response.content)
+        assert "groupID" in orjson.loads(response.content)
 
     def test_ruby(self):
-        project = self.create_project(teams=[self.team], name='foo', platform='ruby')
+        project = self.create_project(teams=[self.team], name="foo", platform="ruby")
 
         url = reverse(
-            'sentry-api-0-project-create-sample',
+            "sentry-api-0-project-create-sample",
             kwargs={
-                'organization_slug': project.organization.slug,
-                'project_slug': project.slug,
-            }
+                "organization_id_or_slug": project.organization.slug,
+                "project_id_or_slug": project.slug,
+            },
         )
-        response = self.client.post(url, format='json')
+        response = self.client.post(url, format="json")
 
         assert response.status_code == 200, response.content
-        assert 'groupID' in json.loads(response.content)
+        assert "groupID" in orjson.loads(response.content)
+
+    def test_attempted_path_traversal_returns_400(self):
+        project = self.create_project(teams=[self.team], name="foo", platform="../../../etc/passwd")
+
+        url = reverse(
+            "sentry-api-0-project-create-sample",
+            kwargs={
+                "organization_id_or_slug": project.organization.slug,
+                "project_id_or_slug": project.slug,
+            },
+        )
+
+        response = self.client.post(url, format="json")
+        assert response.status_code == 400

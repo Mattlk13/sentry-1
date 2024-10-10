@@ -1,120 +1,60 @@
-from __future__ import absolute_import, print_function
+from __future__ import annotations
 
-__all__ = ('Attribute', 'Event', 'Map')
-
-import six
-from uuid import uuid1
+import datetime as dt
 from base64 import b64encode
+from collections.abc import Mapping, Sequence
+from typing import Any
+from uuid import uuid1
 
-from collections import Mapping
 from django.utils import timezone
 
-from sentry.utils.dates import to_timestamp
+from sentry.analytics.attribute import Attribute
+from sentry.analytics.utils import get_data
 
 
-class Attribute(object):
-    def __init__(self, name, type=six.text_type, required=True):
-        self.name = name
-        self.type = type
-        self.required = required
+class Event:
+    __slots__ = ["uuid", "data", "datetime"]
 
-    def extract(self, value):
-        if value is None:
-            return value
-        return self.type(value)
-
-
-class Map(Attribute):
-    def __init__(self, name, attributes=None, required=True):
-        self.name = name
-        self.required = required
-        self.attributes = attributes
-
-    def extract(self, value):
-        """
-        If passed a non dictionary we assume we can pull attributes from it.
-
-        This will hard error in some situations if you're passing a bad type
-        (like an int).
-        """
-        if value is None:
-            return value
-
-        if not isinstance(value, Mapping):
-            new_value = {}
-            for attr in self.attributes:
-                new_value[attr.name] = attr.extract(getattr(value, attr.name, None))
-            items = new_value
-        else:
-            # ensure we dont mutate the original
-            # we dont need to deepcopy as if it recurses into another Map it
-            # will once again copy itself
-            items = value.copy()
-
-        data = {}
-        for attr in self.attributes:
-            nv = items.pop(attr.name, None)
-            if attr.required and nv is None:
-                raise ValueError(u'{} is required (cannot be None)'.format(
-                    attr.name,
-                ))
-
-            data[attr.name] = attr.extract(nv)
-
-        if items:
-            raise ValueError(
-                u'Unknown attributes: {}'.format(
-                    ', '.join(map(six.text_type, six.iterkeys(items))),
-                )
-            )
-
-        return data
-
-
-class Event(object):
-    __slots__ = ['uuid', 'attributes', 'data', 'datetime', 'type']
-
+    # This MUST be overridden by child classes.
     type = None
 
-    attributes = ()
+    # These should be overridden by child classes.
+    attributes: Sequence[Attribute] = ()
 
-    def __init__(self, type=None, datetime=None, **items):
+    def __init__(
+        self, type: Any | None = None, datetime: dt.datetime | None = None, **items: Any
+    ) -> None:
         self.uuid = uuid1()
-
         self.datetime = datetime or timezone.now()
-        if type is not None:
-            self.type = type
+        self.type = self._get_type(type)  # type: ignore[misc]
+        self.data = get_data(self.attributes, items)
+
+    def _get_type(self, _type: Any | None = None) -> Any:
+        """
+        The Event's `type` can either be passed in as a parameter or set as a
+        property on a child class.
+        """
+        if _type is not None:
+            return _type
 
         if self.type is None:
-            raise ValueError('Event is missing type')
+            raise ValueError("Event is missing type")
 
-        data = {}
-        for attr in self.attributes:
-            nv = items.pop(attr.name, None)
-            if attr.required and nv is None:
-                raise ValueError(u'{} is required (cannot be None)'.format(
-                    attr.name,
-                ))
-            data[attr.name] = attr.extract(nv)
+        return self.type
 
-        if items:
-            raise ValueError(u'Unknown attributes: {}'.format(
-                ', '.join(six.iterkeys(items)),
-            ))
-
-        self.data = data
-
-    def serialize(self):
+    def serialize(self) -> Mapping[str, Any]:
         return {
-            'uuid': b64encode(self.uuid.bytes),
-            'timestamp': to_timestamp(self.datetime),
-            'type': self.type,
-            'data': self.data,
+            "uuid": b64encode(self.uuid.bytes),
+            "timestamp": self.datetime.timestamp(),
+            "type": self.type,
+            "data": self.data,
         }
 
     @classmethod
-    def from_instance(cls, instance, **kwargs):
-        values = {}
-        for attr in cls.attributes:
-            values[attr.name] = kwargs.get(attr.name, getattr(instance, attr.name, None))
-        return cls(**values)
+    def from_instance(cls, instance: Any, **kwargs: Any) -> Event:
+        return cls(
+            **{
+                attr.name: kwargs.get(attr.name, getattr(instance, attr.name, None))
+                for attr in cls.attributes
+            }
+        )

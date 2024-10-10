@@ -1,15 +1,23 @@
-from __future__ import absolute_import, print_function
+from django.urls import re_path
 
-from django.conf.urls import patterns, url
-
+from .installation import GitHubIntegrationsInstallationEndpoint
+from .search import GithubSharedSearchEndpoint
 from .webhook import GitHubIntegrationsWebhookEndpoint
-from .search import GitHubSearchEndpoint
 
-urlpatterns = patterns(
-    '',
-    url(r'^webhook/$', GitHubIntegrationsWebhookEndpoint.as_view()),
-    url(r'^search/(?P<organization_slug>[^\/]+)/(?P<integration_id>\d+)/$',
-        GitHubSearchEndpoint.as_view(),
-        name='sentry-extensions-github-search'
-        ),
-)
+urlpatterns = [
+    re_path(
+        r"^webhook/$",
+        GitHubIntegrationsWebhookEndpoint.as_view(),
+        name="sentry-integration-github-webhook",
+    ),
+    re_path(
+        r"^installation/(?P<installation_id>\d+)/$",
+        GitHubIntegrationsInstallationEndpoint.as_view(),
+        name="sentry-integration-github-installation",
+    ),
+    re_path(
+        r"^search/(?P<organization_id_or_slug>[^\/]+)/(?P<integration_id>\d+)/$",
+        GithubSharedSearchEndpoint.as_view(),
+        name="sentry-integration-github-search",
+    ),
+]

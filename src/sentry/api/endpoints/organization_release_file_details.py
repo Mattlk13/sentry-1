@@ -1,41 +1,30 @@
-from __future__ import absolute_import
-import posixpath
-
 from rest_framework import serializers
+from rest_framework.request import Request
 from rest_framework.response import Response
 
-from sentry.api.base import DocSection
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import region_silo_endpoint
 from sentry.api.bases.organization import OrganizationReleasesBaseEndpoint
+from sentry.api.endpoints.project_release_file_details import ReleaseFileDetailsMixin
 from sentry.api.exceptions import ResourceDoesNotExist
-from sentry.api.serializers import serialize
-from sentry.models import Release, ReleaseFile
-try:
-    from django.http import (CompatibleStreamingHttpResponse as StreamingHttpResponse)
-except ImportError:
-    from django.http import StreamingHttpResponse
+from sentry.models.release import Release
 
 
 class ReleaseFileSerializer(serializers.Serializer):
     name = serializers.CharField(max_length=200, required=True)
 
 
-class OrganizationReleaseFileDetailsEndpoint(OrganizationReleasesBaseEndpoint):
-    doc_section = DocSection.RELEASES
+@region_silo_endpoint
+class OrganizationReleaseFileDetailsEndpoint(
+    OrganizationReleasesBaseEndpoint, ReleaseFileDetailsMixin
+):
+    publish_status = {
+        "DELETE": ApiPublishStatus.UNKNOWN,
+        "GET": ApiPublishStatus.UNKNOWN,
+        "PUT": ApiPublishStatus.UNKNOWN,
+    }
 
-    def download(self, releasefile):
-        file = releasefile.file
-        fp = file.getfile()
-        response = StreamingHttpResponse(
-            iter(lambda: fp.read(4096), b''),
-            content_type=file.headers.get('content-type', 'application/octet-stream'),
-        )
-        response['Content-Length'] = file.size
-        response['Content-Disposition'] = 'attachment; filename="%s"' % posixpath.basename(
-            " ".join(releasefile.name.split())
-        )
-        return response
-
-    def get(self, request, organization, version, file_id):
+    def get(self, request: Request, organization, version, file_id) -> Response:
         """
         Retrieve an Organization Release's File
         ```````````````````````````````````````
@@ -44,39 +33,28 @@ class OrganizationReleaseFileDetailsEndpoint(OrganizationReleasesBaseEndpoint):
         not actually return the contents of the file, just the associated
         metadata.
 
-        :pparam string organization_slug: the slug of the organization the
+        :pparam string organization_id_or_slug: the id or slug of the organization the
                                           release belongs to.
         :pparam string version: the version identifier of the release.
         :pparam string file_id: the ID of the file to retrieve.
         :auth: required
         """
         try:
-            release = Release.objects.get(
-                organization_id=organization.id,
-                version=version,
-            )
+            release = Release.objects.get(organization_id=organization.id, version=version)
         except Release.DoesNotExist:
             raise ResourceDoesNotExist
 
         if not self.has_release_permission(request, organization, release):
             raise ResourceDoesNotExist
 
-        try:
-            releasefile = ReleaseFile.objects.get(
-                release=release,
-                id=file_id,
-            )
-        except ReleaseFile.DoesNotExist:
-            raise ResourceDoesNotExist
+        return self.get_releasefile(
+            request,
+            release,
+            file_id,
+            check_permission_fn=lambda: request.access.has_scope("project:write"),
+        )
 
-        download_requested = request.GET.get('download') is not None
-        if download_requested and (request.access.has_scope('project:write')):
-            return self.download(releasefile)
-        elif download_requested:
-            return Response(status=403)
-        return Response(serialize(releasefile, request.user))
-
-    def put(self, request, organization, version, file_id):
+    def put(self, request: Request, organization, version, file_id) -> Response:
         """
         Update an Organization Release's File
         `````````````````````````````````````
@@ -84,7 +62,7 @@ class OrganizationReleaseFileDetailsEndpoint(OrganizationReleasesBaseEndpoint):
         Update metadata of an existing file.  Currently only the name of
         the file can be changed.
 
-        :pparam string organization_slug: the slug of the organization the
+        :pparam string organization_id_or_slug: the id or slug of the organization the
                                           release belongs to.
         :pparam string version: the version identifier of the release.
         :pparam string file_id: the ID of the file to update.
@@ -93,38 +71,16 @@ class OrganizationReleaseFileDetailsEndpoint(OrganizationReleasesBaseEndpoint):
         :auth: required
         """
         try:
-            release = Release.objects.get(
-                organization_id=organization.id,
-                version=version,
-            )
+            release = Release.objects.get(organization_id=organization.id, version=version)
         except Release.DoesNotExist:
             raise ResourceDoesNotExist
 
         if not self.has_release_permission(request, organization, release):
             raise ResourceDoesNotExist
 
-        try:
-            releasefile = ReleaseFile.objects.get(
-                release=release,
-                id=file_id,
-            )
-        except ReleaseFile.DoesNotExist:
-            raise ResourceDoesNotExist
+        return self.update_releasefile(request, release, file_id)
 
-        serializer = ReleaseFileSerializer(data=request.data)
-
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=400)
-
-        result = serializer.validated_data
-
-        releasefile.update(
-            name=result['name'],
-        )
-
-        return Response(serialize(releasefile, request.user))
-
-    def delete(self, request, organization, version, file_id):
+    def delete(self, request: Request, organization, version, file_id) -> Response:
         """
         Delete an Organization Release's File
         `````````````````````````````````````
@@ -133,36 +89,18 @@ class OrganizationReleaseFileDetailsEndpoint(OrganizationReleasesBaseEndpoint):
 
         This will also remove the physical file from storage.
 
-        :pparam string organization_slug: the slug of the organization the
+        :pparam string organization_id_or_slug: the id or slug of the organization the
                                           release belongs to.
         :pparam string version: the version identifier of the release.
         :pparam string file_id: the ID of the file to delete.
         :auth: required
         """
         try:
-            release = Release.objects.get(
-                organization_id=organization.id,
-                version=version,
-            )
+            release = Release.objects.get(organization_id=organization.id, version=version)
         except Release.DoesNotExist:
             raise ResourceDoesNotExist
 
         if not self.has_release_permission(request, organization, release):
             raise ResourceDoesNotExist
 
-        try:
-            releasefile = ReleaseFile.objects.get(
-                release=release,
-                id=file_id,
-            )
-        except ReleaseFile.DoesNotExist:
-            raise ResourceDoesNotExist
-
-        file = releasefile.file
-
-        # TODO(dcramer): this doesnt handle a failure from file.deletefile() to
-        # the actual deletion of the db row
-        releasefile.delete()
-        file.delete()
-
-        return Response(status=204)
+        return self.delete_releasefile(release, file_id)

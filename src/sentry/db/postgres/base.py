@@ -1,21 +1,21 @@
-from __future__ import absolute_import
-
-from six import string_types
 import psycopg2 as Database
 
 # Some of these imports are unused, but they are inherited from other engines
 # and should be available as part of the backend ``base.py`` namespace.
-from django.db.backends.postgresql_psycopg2.base import DatabaseWrapper
-
-from .decorators import (
-    capture_transaction_exceptions, auto_reconnect_cursor, auto_reconnect_connection,
-    less_shitty_error_messages
-)
-from .operations import DatabaseOperations
+from django.db.backends.postgresql.base import DatabaseWrapper as DjangoDatabaseWrapper
+from django.db.backends.postgresql.operations import DatabaseOperations
 
 from sentry.utils.strings import strip_lone_surrogates
 
-__all__ = ('DatabaseWrapper', )
+from .decorators import (
+    auto_reconnect_connection,
+    auto_reconnect_cursor,
+    capture_transaction_exceptions,
+    more_better_error_messages,
+)
+from .schema import DatabaseSchemaEditorProxy
+
+__all__ = ("DatabaseWrapper",)
 
 
 def remove_null(value):
@@ -27,7 +27,9 @@ def remove_null(value):
     # somewhat legible rather than error. Considering this is better
     # behavior than the database truncating, seems good to do this
     # rather than attempting to sanitize all data inputs now manually.
-    return value.replace('\x00', '')
+    if type(value) is bytes:
+        return value.replace(b"\x00", b"")
+    return value.replace("\x00", "")
 
 
 def remove_surrogates(value):
@@ -36,21 +38,29 @@ def remove_surrogates(value):
     # our string we need to remove it.
     if type(value) is bytes:
         try:
-            return strip_lone_surrogates(value.decode('utf-8')).encode('utf-8')
+            return strip_lone_surrogates(value.decode("utf-8")).encode("utf-8")
         except UnicodeError:
             return value
     return strip_lone_surrogates(value)
 
 
 def clean_bad_params(params):
+    # Support dictionary of parameters for %(key)s placeholders
+    # in raw SQL queries.
+    if isinstance(params, dict):
+        for key, param in params.items():
+            if isinstance(param, (str, bytes)):
+                params[key] = remove_null(remove_surrogates(param))
+        return params
+
     params = list(params)
     for idx, param in enumerate(params):
-        if isinstance(param, string_types):
+        if isinstance(param, (str, bytes)):
             params[idx] = remove_null(remove_surrogates(param))
     return params
 
 
-class CursorWrapper(object):
+class CursorWrapper:
     """
     A wrapper around the postgresql_psycopg2 backend which handles various events
     from cursors, such as auto reconnects and lazy time zone evaluation.
@@ -68,7 +78,7 @@ class CursorWrapper(object):
 
     @capture_transaction_exceptions
     @auto_reconnect_cursor
-    @less_shitty_error_messages
+    @more_better_error_messages
     def execute(self, sql, params=None):
         if params is not None:
             return self.cursor.execute(sql, clean_bad_params(params))
@@ -76,28 +86,39 @@ class CursorWrapper(object):
 
     @capture_transaction_exceptions
     @auto_reconnect_cursor
-    @less_shitty_error_messages
+    @more_better_error_messages
     def executemany(self, sql, paramlist=()):
         return self.cursor.executemany(sql, paramlist)
 
 
-class DatabaseWrapper(DatabaseWrapper):
+class DatabaseWrapper(DjangoDatabaseWrapper):
+    SchemaEditorClass = DatabaseSchemaEditorProxy
+    queries_limit = 15000
+
     def __init__(self, *args, **kwargs):
-        super(DatabaseWrapper, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.ops = DatabaseOperations(self)
 
     @auto_reconnect_connection
     def _set_isolation_level(self, level):
-        return super(DatabaseWrapper, self)._set_isolation_level(level)
+        return super()._set_isolation_level(level)
 
     @auto_reconnect_connection
     def _cursor(self, *args, **kwargs):
-        cursor = super(DatabaseWrapper, self)._cursor()
-        return CursorWrapper(self, cursor)
+        return super()._cursor()
+
+    # We're overriding this internal method that's present in Django 1.11+, because
+    # things were shuffled around since 1.10 resulting in not constructing a django CursorWrapper
+    # with our CursorWrapper. We need to be passing our wrapped cursor to their wrapped cursor,
+    # not the other way around since then we'll lose things like __enter__ due to the way this
+    # wrapper is working (getattr on self.cursor).
+    def _prepare_cursor(self, cursor):
+        cursor = super()._prepare_cursor(CursorWrapper(self, cursor))
+        return cursor
 
     def close(self, reconnect=False):
         """
-        This ensures we dont error if the connection has already been closed.
+        This ensures we don't error if the connection has already been closed.
         """
         if self.connection is not None:
             if not self.connection.closed:

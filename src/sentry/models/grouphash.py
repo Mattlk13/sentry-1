@@ -1,63 +1,51 @@
-from __future__ import absolute_import
+from __future__ import annotations
 
-from django.conf import settings
+from typing import TYPE_CHECKING
+
 from django.db import models
-from django.db.models.signals import post_delete
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 
-from sentry.db.models import BoundedPositiveIntegerField, FlexibleForeignKey, Model
-from sentry.utils import redis
+from sentry.backup.scopes import RelocationScope
+from sentry.db.models import (
+    BoundedPositiveIntegerField,
+    FlexibleForeignKey,
+    Model,
+    region_silo_model,
+)
+from sentry.db.models.base import sane_repr
+
+if TYPE_CHECKING:
+    from sentry.models.grouphashmetadata import GroupHashMetadata
 
 
+@region_silo_model
 class GroupHash(Model):
-    __core__ = False
+    __relocation_scope__ = RelocationScope.Excluded
 
     class State:
         UNLOCKED = None
         LOCKED_IN_MIGRATION = 1
 
-    project = FlexibleForeignKey('sentry.Project', null=True)
+    project = FlexibleForeignKey("sentry.Project", null=True)
     hash = models.CharField(max_length=32)
-    group = FlexibleForeignKey('sentry.Group', null=True)
+    group = FlexibleForeignKey("sentry.Group", null=True)
+
+    # not-null => the event should be discarded
     group_tombstone_id = BoundedPositiveIntegerField(db_index=True, null=True)
     state = BoundedPositiveIntegerField(
-        choices=[
-            (State.LOCKED_IN_MIGRATION, _('Locked (Migration in Progress)')),
-        ],
-        null=True,
+        choices=[(State.LOCKED_IN_MIGRATION, _("Locked (Migration in Progress)"))], null=True
     )
 
     class Meta:
-        app_label = 'sentry'
-        db_table = 'sentry_grouphash'
-        unique_together = (('project', 'hash'), )
+        app_label = "sentry"
+        db_table = "sentry_grouphash"
+        unique_together = (("project", "hash"),)
 
-    @classmethod
-    def __get_last_processed_event_id_cluster(cls):
-        cluster_name = getattr(settings, 'GROUP_HASH_LAST_PROCESSED_EVENT_CLUSTER_NAME', 'default')
-        return redis.clusters.get(cluster_name)
+    @property
+    def metadata(self) -> GroupHashMetadata | None:
+        try:
+            return self._metadata
+        except AttributeError:
+            return None
 
-    @classmethod
-    def fetch_last_processed_event_id(cls, group_hash_ids):
-        with cls.__get_last_processed_event_id_cluster().map() as client:
-            results = [client.get(u'gh:lp:{}'.format(id)) for id in group_hash_ids]
-        return [result.value for result in results]
-
-    @classmethod
-    def record_last_processed_event_id(cls, group_hash_id, event_id):
-        with cls.__get_last_processed_event_id_cluster().map() as client:
-            key = u'gh:lp:{}'.format(group_hash_id)
-            client.set(key, u'{}'.format(event_id))
-            client.expire(key, 7776000)  # 90d
-
-    @classmethod
-    def delete_last_processed_event_id(cls, group_hash_id):
-        with cls.__get_last_processed_event_id_cluster().map() as client:
-            client.delete(u'gh:lp:{}'.format(group_hash_id))
-
-
-post_delete.connect(
-    lambda instance, **kwargs: GroupHash.delete_last_processed_event_id(instance.id),
-    sender=GroupHash,
-    weak=False,
-)
+    __repr__ = sane_repr("group_id", "hash")

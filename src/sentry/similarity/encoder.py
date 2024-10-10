@@ -1,15 +1,8 @@
-from __future__ import absolute_import
-
-from collections import (Mapping, Set, Sequence)
-
-import six
+from collections.abc import Mapping, Sequence, Set
 
 
-class Encoder(object):
-    try:
-        number_types = (int, long, float)  # noqa
-    except NameError:
-        number_types = (int, float)
+class Encoder:
+    number_types = (int, float)
 
     def __init__(self, types=None):
         self.types = types if types is not None else {}
@@ -19,32 +12,19 @@ class Encoder(object):
             if isinstance(value, cls):
                 value = function(value)
 
-        if isinstance(value, six.binary_type):
+        if isinstance(value, bytes):
             return value
-        elif isinstance(value, six.text_type):
-            return value.encode('utf8')
+        elif isinstance(value, str):
+            return value.encode("utf8")
         elif isinstance(value, self.number_types):
-            return six.text_type(value).encode('utf8')
+            return str(value).encode("utf8")
         elif isinstance(value, Set):
-            return '\x00'.join(sorted(
-                map(
-                    self.dumps,
-                    value,
-                ),
-            ))
+            return b"\x00".join(sorted(map(self.dumps, value)))
         elif isinstance(value, Sequence):
-            return '\x01'.join(
-                map(
-                    self.dumps,
-                    value,
-                ),
-            )
+            return b"\x01".join(map(self.dumps, value))
         elif isinstance(value, Mapping):
-            return '\x02'.join(
-                sorted('\x01'.join(map(
-                    self.dumps,
-                    item,
-                )) for item in value.items()),
+            return b"\x02".join(
+                sorted(b"\x01".join(map(self.dumps, item)) for item in value.items())
             )
         else:
-            raise TypeError(u'Unsupported type: {}'.format(type(value)))
+            raise TypeError(f"Unsupported type: {type(value)}")

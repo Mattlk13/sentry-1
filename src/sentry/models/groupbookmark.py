@@ -1,31 +1,31 @@
-from __future__ import absolute_import
-
 from django.conf import settings
 from django.db import models
 from django.utils import timezone
 
-from sentry.db.models import FlexibleForeignKey, Model, BaseManager, sane_repr
+from sentry.backup.scopes import RelocationScope
+from sentry.db.models import FlexibleForeignKey, Model, region_silo_model, sane_repr
+from sentry.db.models.fields.hybrid_cloud_foreign_key import HybridCloudForeignKey
 
 
+@region_silo_model
 class GroupBookmark(Model):
     """
     Identifies a bookmark relationship between a user and an
     aggregated event (Group).
     """
-    __core__ = False
 
-    project = FlexibleForeignKey('sentry.Project', related_name="bookmark_set")
-    group = FlexibleForeignKey('sentry.Group', related_name="bookmark_set")
+    __relocation_scope__ = RelocationScope.Excluded
+
+    project = FlexibleForeignKey("sentry.Project", related_name="bookmark_set")
+    group = FlexibleForeignKey("sentry.Group", related_name="bookmark_set")
     # namespace related_name on User since we don't own the model
-    user = FlexibleForeignKey(settings.AUTH_USER_MODEL, related_name="sentry_bookmark_set")
+    user_id = HybridCloudForeignKey(settings.AUTH_USER_MODEL, on_delete="CASCADE")
     date_added = models.DateTimeField(default=timezone.now, null=True)
 
-    objects = BaseManager()
-
     class Meta:
-        app_label = 'sentry'
-        db_table = 'sentry_groupbookmark'
+        app_label = "sentry"
+        db_table = "sentry_groupbookmark"
         # composite index includes project for efficient queries
-        unique_together = (('project', 'user', 'group'), )
+        unique_together = (("project", "user_id", "group"),)
 
-    __repr__ = sane_repr('project_id', 'group_id', 'user_id')
+    __repr__ = sane_repr("project_id", "group_id", "user_id")

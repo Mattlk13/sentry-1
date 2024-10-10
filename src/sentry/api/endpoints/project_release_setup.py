@@ -1,14 +1,26 @@
-from __future__ import absolute_import
-
-from sentry.api.bases.project import ProjectEndpoint, ProjectReleasePermission
-from sentry.models import Group, ReleaseCommit, Repository, Deploy
+from django.core.cache import cache
+from rest_framework.request import Request
 from rest_framework.response import Response
 
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import region_silo_endpoint
+from sentry.api.bases.project import ProjectEndpoint, ProjectReleasePermission
+from sentry.models.deploy import Deploy
+from sentry.models.group import Group
+from sentry.models.releasecommit import ReleaseCommit
+from sentry.models.releases.release_project import ReleaseProject
+from sentry.models.repository import Repository
+from sentry.utils.hashlib import hash_values
 
+
+@region_silo_endpoint
 class ProjectReleaseSetupCompletionEndpoint(ProjectEndpoint):
-    permission_classes = (ProjectReleasePermission, )
+    publish_status = {
+        "GET": ApiPublishStatus.UNKNOWN,
+    }
+    permission_classes = (ProjectReleasePermission,)
 
-    def get(self, request, project):
+    def get(self, request: Request, project) -> Response:
         """
         Get list with release setup progress for a project
         1. tag an error
@@ -17,40 +29,47 @@ class ProjectReleaseSetupCompletionEndpoint(ProjectEndpoint):
         4. tell sentry about a deploy
         """
 
-        tag = Group.objects.filter(
-            project=project.id,
-            first_release__isnull=False,
-        ).exists()
+        tag_key = "onboard_tag:1:%s" % (project.id)
+        repo_key = "onboard_repo:1:%s" % (project.organization_id)
+        commit_key = "onboard_commit:1:%s" % hash_values([project.organization_id, project.id])
+        deploy_key = "onboard_deploy:1:%s" % hash_values([project.organization_id, project.id])
+        onboard_cache = cache.get_many([tag_key, repo_key, commit_key, deploy_key])
 
-        repo = Repository.objects.filter(
-            organization_id=project.organization_id,
-        ).exists()
+        tag = onboard_cache.get(tag_key)
+        if tag is None:
+            tag = Group.objects.filter(project=project.id, first_release__isnull=False).exists()
+            cache.set(tag_key, tag, 3600 if tag else 60)
 
-        commit = ReleaseCommit.objects.filter(
-            organization_id=project.organization_id,
-            release__projects=project.id,
-        ).exists()
+        repo = onboard_cache.get(repo_key)
+        if repo is None:
+            repo = Repository.objects.filter(organization_id=project.organization_id).exists()
+            cache.set(repo_key, repo, 3600 if repo else 60)
 
-        deploy = Deploy.objects.filter(
-            organization_id=project.organization_id,
-            release__projects=project.id,
-        ).exists()
+        commit = onboard_cache.get(commit_key)
+        if commit is None:
+            # only get the last 1000 releases
+            release_ids = (
+                ReleaseProject.objects.filter(project=project.id)
+                .order_by("-release_id")
+                .values_list("release_id", flat=True)
+            )[:1000]
+            commit = ReleaseCommit.objects.filter(
+                organization_id=project.organization_id, release__id__in=release_ids
+            ).exists()
+            cache.set(commit_key, commit, 3600 if commit else 60)
 
-        return Response([
-            {
-                'step': 'tag',
-                'complete': bool(tag),
-            },
-            {
-                'step': 'repo',
-                'complete': bool(repo),
-            },
-            {
-                'step': 'commit',
-                'complete': bool(commit),
-            },
-            {
-                'step': 'deploy',
-                'complete': bool(deploy),
-            }
-        ])
+        deploy = onboard_cache.get(deploy_key)
+        if deploy is None:
+            deploy = Deploy.objects.filter(
+                organization_id=project.organization_id, release__projects=project.id
+            ).exists()
+            cache.set(deploy_key, deploy, 3600 if deploy else 60)
+
+        return Response(
+            [
+                {"step": "tag", "complete": bool(tag)},
+                {"step": "repo", "complete": bool(repo)},
+                {"step": "commit", "complete": bool(commit)},
+                {"step": "deploy", "complete": bool(deploy)},
+            ]
+        )

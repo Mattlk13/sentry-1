@@ -1,8 +1,5 @@
-from __future__ import absolute_import, print_function
+from __future__ import annotations
 
-__all__ = ['AuthView', 'ConfigureView']
-
-from sentry.plugins.base.view import PluggableViewMixin
 from sentry.web.frontend.base import BaseView
 
 
@@ -12,20 +9,13 @@ class AuthView(BaseView):
 
     See ``BaseView`` for capabilities.
     """
+
     auth_required = False
     sudo_required = False
 
-    def get_ident(self):
+    def get_ident(self) -> str:
         cls = type(self)
-        return u'{module}.{name}'.format(
-            module=cls.__module__,
-            name=cls.__name__,
-        )
+        return f"{cls.__module__}.{cls.__name__}"
 
 
-class ConfigureView(BaseView, PluggableViewMixin):
-    """
-    """
-
-    def dispatch(self, request, organization, auth_provider):
-        return ''
+__all__ = ("AuthView",)

@@ -1,17 +1,25 @@
-from __future__ import absolute_import
+from rest_framework.request import Request
+from rest_framework.response import Response
 
 from sentry import tagstore
-from sentry.api.base import DocSection, EnvironmentMixin
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import EnvironmentMixin, region_silo_endpoint
 from sentry.api.bases.project import ProjectEndpoint
 from sentry.api.exceptions import ResourceDoesNotExist
 from sentry.api.serializers import serialize
-from sentry.models import Environment
+from sentry.api.utils import get_date_range_from_params
+from sentry.models.environment import Environment
 
 
+@region_silo_endpoint
 class ProjectTagKeyValuesEndpoint(ProjectEndpoint, EnvironmentMixin):
-    doc_section = DocSection.PROJECTS
+    owner = ApiOwner.UNOWNED
+    publish_status = {
+        "GET": ApiPublishStatus.UNKNOWN,
+    }
 
-    def get(self, request, project, key):
+    def get(self, request: Request, project, key) -> Response:
         """
         List a Tag's Values
         ```````````````````
@@ -19,14 +27,15 @@ class ProjectTagKeyValuesEndpoint(ProjectEndpoint, EnvironmentMixin):
         Return a list of values associated with this key.  The `query`
         parameter can be used to to perform a "contains" match on
         values.
+        When paginated can return at most 1000 values.
 
-        :pparam string organization_slug: the slug of the organization.
-        :pparam string project_slug: the slug of the project.
+        :pparam string organization_id_or_slug: the id or slug of the organization.
+        :pparam string project_id_or_slug: the id or slug of the project.
         :pparam string key: the tag key to look up.
         :auth: required
         """
-        lookup_key = tagstore.prefix_reserved_key(key)
-
+        lookup_key = tagstore.backend.prefix_reserved_key(key)
+        tenant_ids = {"organization_id": project.organization_id}
         try:
             environment_id = self._get_environment_id_from_request(request, project.organization_id)
         except Environment.DoesNotExist:
@@ -34,16 +43,26 @@ class ProjectTagKeyValuesEndpoint(ProjectEndpoint, EnvironmentMixin):
             raise ResourceDoesNotExist
 
         try:
-            tagkey = tagstore.get_tag_key(project.id, environment_id, lookup_key)
+            tagkey = tagstore.backend.get_tag_key(
+                project.id,
+                environment_id,
+                lookup_key,
+                tenant_ids=tenant_ids,
+            )
         except tagstore.TagKeyNotFound:
             raise ResourceDoesNotExist
 
-        paginator = tagstore.get_tag_value_paginator(
+        start, end = get_date_range_from_params(request.GET)
+
+        paginator = tagstore.backend.get_tag_value_paginator(
             project.id,
             environment_id,
             tagkey.key,
-            query=request.GET.get('query'),
-            order_by='-last_seen',
+            start=start,
+            end=end,
+            query=request.GET.get("query"),
+            order_by="-last_seen",
+            tenant_ids=tenant_ids,
         )
 
         return self.paginate(

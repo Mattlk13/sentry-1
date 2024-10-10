@@ -1,15 +1,17 @@
-from __future__ import absolute_import
-
 from django.db import models
-from sentry.db.models import BoundedBigIntegerField, Model, sane_repr
+
+from sentry.backup.scopes import RelocationScope
+from sentry.db.models import BoundedBigIntegerField, Model, region_silo_model, sane_repr
 
 
+@region_silo_model
 class GroupRedirect(Model):
     """
     Maintains a reference from a group that has been merged (and subsequently
-    deleted) to the group that superceded it.
+    deleted) to the group that superseded it.
     """
-    __core__ = False
+
+    __relocation_scope__ = RelocationScope.Excluded
 
     organization_id = BoundedBigIntegerField(null=True)
     group_id = BoundedBigIntegerField(db_index=True)
@@ -18,15 +20,12 @@ class GroupRedirect(Model):
     previous_project_slug = models.SlugField(null=True)
 
     class Meta:
-        db_table = 'sentry_groupredirect'
-        app_label = 'sentry'
-        unique_together = (('organization_id', 'previous_short_id', 'previous_project_slug'),)
+        db_table = "sentry_groupredirect"
+        app_label = "sentry"
+        unique_together = (("organization_id", "previous_short_id", "previous_project_slug"),)
 
     __repr__ = sane_repr(
-        'group_id',
-        'previous_group_id',
-        'previous_short_id',
-        'previous_project_slug',
+        "group_id", "previous_group_id", "previous_short_id", "previous_project_slug"
     )
 
     @classmethod

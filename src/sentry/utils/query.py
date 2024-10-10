@@ -1,24 +1,79 @@
-from __future__ import absolute_import
+from __future__ import annotations
+
+import re
 
 import progressbar
-import re
-import six
+from django.db import connections, router
 
-from django.db import connections, IntegrityError, router, transaction
-from django.db.models import ForeignKey
-from django.db.models.deletion import Collector
-from django.db.models.signals import pre_delete, pre_save, post_save, post_delete
+from sentry import eventstore
 
-from sentry.utils import db
-
-_leaf_re = re.compile(r'^(UserReport|Event|Group)(.+)')
+_leaf_re = re.compile(r"^(UserReport|Event|Group)(.+)")
 
 
 class InvalidQuerySetError(ValueError):
     pass
 
 
-class RangeQuerySetWrapper(object):
+def celery_run_batch_query(
+    filter,
+    batch_size,
+    referrer,
+    state=None,
+    fetch_events=True,
+    tenant_ids=None,
+):
+    """
+    A tool for batched queries similar in purpose to RangeQuerySetWrapper that
+    is used for celery tasks in issue merge/unmerge/reprocessing.
+    """
+
+    # We process events sorted in descending order by -timestamp, -event_id. We need
+    # to include event_id as well as timestamp in the ordering criteria since:
+    #
+    # - Event timestamps are rounded to the second so multiple events are likely
+    # to have the same timestamp.
+    #
+    # - When sorting by timestamp alone, Snuba may not give us a deterministic
+    # order for events with the same timestamp.
+    #
+    # - We need to ensure that we do not skip any events between batches. If we
+    # only sorted by timestamp < last_event.timestamp it would be possible to
+    # have missed an event with the same timestamp as the last item in the
+    # previous batch.
+    #
+    # state contains data about the last event ID and timestamp. Changing
+    # the keys in here needs to be done carefully as the state object is
+    # semi-persisted in celery queues.
+    if state is not None:
+        filter.conditions = filter.conditions or []
+        filter.conditions.append(["timestamp", "<=", state["timestamp"]])
+        filter.conditions.append(
+            [["timestamp", "<", state["timestamp"]], ["event_id", "<", state["event_id"]]]
+        )
+
+    method = (
+        eventstore.backend.get_events if fetch_events else eventstore.backend.get_unfetched_events
+    )
+
+    events = list(
+        method(
+            filter=filter,
+            limit=batch_size,
+            referrer=referrer,
+            orderby=["-timestamp", "-event_id"],
+            tenant_ids=tenant_ids,
+        )
+    )
+
+    if events:
+        state = {"timestamp": events[-1].timestamp, "event_id": events[-1].event_id}
+    else:
+        state = None
+
+    return state, events
+
+
+class RangeQuerySetWrapper:
     """
     Iterates through a queryset by chunking results by ``step`` and using GREATER THAN
     and LESS THAN queries on the primary key.
@@ -26,10 +81,21 @@ class RangeQuerySetWrapper(object):
     Very efficient, but ORDER BY statements will not work.
     """
 
-    def __init__(self, queryset, step=1000, limit=None, min_id=None, order_by='pk', callbacks=()):
+    def __init__(
+        self,
+        queryset,
+        step=1000,
+        limit=None,
+        min_id=None,
+        order_by="pk",
+        callbacks=(),
+        result_value_getter=None,
+        override_unique_safety_check=False,
+    ):
         # Support for slicing
-        if queryset.query.low_mark == 0 and not \
-                (queryset.query.order_by or queryset.query.extra_order_by):
+        if queryset.query.low_mark == 0 and not (
+            queryset.query.order_by or queryset.query.extra_order_by
+        ):
             if limit is None:
                 limit = queryset.query.high_mark
             queryset.query.clear_limits()
@@ -47,9 +113,19 @@ class RangeQuerySetWrapper(object):
         self.min_value = min_id
         self.order_by = order_by
         self.callbacks = callbacks
+        self.result_value_getter = result_value_getter
+
+        order_by_col = queryset.model._meta.get_field(order_by if order_by != "pk" else "id")
+        if not override_unique_safety_check and not order_by_col.unique:
+            # TODO: Ideally we could fix this bug and support ordering by a non unique col
+            raise InvalidQuerySetError(
+                "Order by column must be unique, otherwise this wrapper can get "
+                "stuck in an infinite loop. If you're sure your data is unique, "
+                "you can disable this by passing "
+                "`override_unique_safety_check=True`"
+            )
 
     def __iter__(self):
-        max_value = None
         if self.min_value is not None:
             cur_value = self.min_value
         else:
@@ -60,15 +136,15 @@ class RangeQuerySetWrapper(object):
 
         queryset = self.queryset
         if self.desc:
-            queryset = queryset.order_by('-%s' % self.order_by)
+            queryset = queryset.order_by("-%s" % self.order_by)
         else:
             queryset = queryset.order_by(self.order_by)
 
         # we implement basic cursor pagination for columns that are not unique
-        last_object_pk = None
+        last_object_pk: int | None = None
         has_results = True
         while has_results:
-            if (max_value and cur_value >= max_value) or (limit and num >= limit):
+            if limit and num >= limit:
                 break
 
             start = num
@@ -76,17 +152,18 @@ class RangeQuerySetWrapper(object):
             if cur_value is None:
                 results = queryset
             elif self.desc:
-                results = queryset.filter(**{'%s__lte' % self.order_by: cur_value})
-            elif not self.desc:
-                results = queryset.filter(**{'%s__gte' % self.order_by: cur_value})
+                results = queryset.filter(**{"%s__lte" % self.order_by: cur_value})
+            else:
+                results = queryset.filter(**{"%s__gte" % self.order_by: cur_value})
 
-            results = list(results[0:self.step])
+            results = list(results[0 : self.step])
 
             for cb in self.callbacks:
                 cb(results)
 
             for result in results:
-                if last_object_pk is not None and result.pk == last_object_pk:
+                pk = self.result_value_getter(result) if self.result_value_getter else result.pk
+                if last_object_pk is not None and pk == last_object_pk:
                     continue
 
                 # Need to bind value before yielding, because the caller
@@ -95,8 +172,12 @@ class RangeQuerySetWrapper(object):
                 # deleting, because a Model.delete() mutates the `id`
                 # to `None` causing the loop to exit early.
                 num += 1
-                last_object_pk = result.pk
-                cur_value = getattr(result, self.order_by)
+                last_object_pk = pk
+                cur_value = (
+                    self.result_value_getter(result)
+                    if self.result_value_getter
+                    else getattr(result, self.order_by)
+                )
 
                 yield result
 
@@ -107,185 +188,73 @@ class RangeQuerySetWrapper(object):
 
 
 class RangeQuerySetWrapperWithProgressBar(RangeQuerySetWrapper):
+    def get_total_count(self):
+        return self.queryset.count()
+
     def __iter__(self):
-        total_count = self.queryset.count()
-        if not total_count:
-            return iter([])
-        iterator = super(RangeQuerySetWrapperWithProgressBar, self).__iter__()
+        total_count = self.get_total_count()
+        iterator = super().__iter__()
         label = self.queryset.model._meta.verbose_name_plural.title()
         return iter(WithProgressBar(iterator, total_count, label))
 
 
-class WithProgressBar(object):
+class RangeQuerySetWrapperWithProgressBarApprox(RangeQuerySetWrapperWithProgressBar):
+    """
+    Works the same as `RangeQuerySetWrapperWithProgressBar`, but approximates the number of rows
+    in the table. This is intended for use on very large tables where we end up timing out
+    attempting to get an accurate count.
+
+    Note: This is only intended for queries that are iterating over an entire table. Will not
+    produce a useful total count on filtered queries.
+    """
+
+    def get_total_count(self):
+        cursor = connections[self.queryset.db].cursor()
+        cursor.execute(
+            "SELECT CAST(GREATEST(reltuples, 0) AS BIGINT) AS estimate FROM pg_class WHERE relname = %s",
+            (self.queryset.model._meta.db_table,),
+        )
+        return cursor.fetchone()[0]
+
+
+class WithProgressBar:
     def __init__(self, iterator, count=None, caption=None):
-        if count is None and hasattr(iterator, '__len__'):
+        if count is None and hasattr(iterator, "__len__"):
             count = len(iterator)
         self.iterator = iterator
         self.count = count
-        self.caption = six.text_type(caption or u'Progress')
+        self.caption = str(caption or "Progress")
 
     def __iter__(self):
-        if self.count != 0:
-            widgets = [
-                '%s: ' % (self.caption, ),
+        pbar = progressbar.ProgressBar(
+            widgets=[
+                f"{self.caption}: ",
                 progressbar.Percentage(),
-                ' ',
+                " ",
                 progressbar.Bar(),
-                ' ',
+                " ",
                 progressbar.ETA(),
-            ]
-            pbar = progressbar.ProgressBar(widgets=widgets, maxval=self.count)
-            pbar.start()
-            for idx, item in enumerate(self.iterator):
-                yield item
-                # It's possible that we've exceeded the maxval, but instead
-                # of exploding on a ValueError, let's just cap it so we don't.
-                # this could happen if new rows were added between calculating `count()`
-                # and actually beginning iteration where we're iterating slightly more
-                # than we thought.
-                pbar.update(min(idx, self.count))
-            pbar.finish()
-
-
-class EverythingCollector(Collector):
-    """
-    More or less identical to the default Django collector except we always
-    return relations (even when they shouldn't matter).
-    """
-
-    def collect(
-        self,
-        objs,
-        source=None,
-        nullable=False,
-        collect_related=True,
-        source_attr=None,
-        reverse_dependency=False
-    ):
-        new_objs = self.add(objs)
-        if not new_objs:
-            return
-
-        model = type(new_objs[0])
-
-        # Recursively collect concrete model's parent models, but not their
-        # related objects. These will be found by meta.get_all_related_objects()
-        concrete_model = model._meta.concrete_model
-        for ptr in six.iteritems(concrete_model._meta.parents):
-            if ptr:
-                # FIXME: This seems to be buggy and execute a query for each
-                # parent object fetch. We have the parent data in the obj,
-                # but we don't have a nice way to turn that data into parent
-                # object instance.
-                parent_objs = [getattr(obj, ptr.name) for obj in new_objs]
-                self.collect(
-                    parent_objs,
-                    source=model,
-                    source_attr=ptr.rel.related_name,
-                    collect_related=False,
-                    reverse_dependency=True
-                )
-
-        if collect_related:
-            for related in model._meta.get_all_related_objects(
-                include_hidden=True, include_proxy_eq=True
-            ):
-                sub_objs = self.related_objects(related, new_objs)
-                self.add(sub_objs)
-
-            # TODO This entire block is only needed as a special case to
-            # support cascade-deletes for GenericRelation. It should be
-            # removed/fixed when the ORM gains a proper abstraction for virtual
-            # or composite fields, and GFKs are reworked to fit into that.
-            for relation in model._meta.many_to_many:
-                if not relation.rel.through:
-                    sub_objs = relation.bulk_related_objects(new_objs, self.using)
-                    self.collect(
-                        sub_objs,
-                        source=model,
-                        source_attr=relation.rel.related_name,
-                        nullable=True
-                    )
-
-
-def merge_into(self, other, callback=lambda x: x, using='default'):
-    """
-    Collects objects related to ``self`` and updates their foreign keys to
-    point to ``other``.
-
-    If ``callback`` is specified, it will be executed on each collected chunk
-    before any changes are made, and should return a modified list of results
-    that still need updated.
-
-    NOTE: Duplicates (unique constraints) which exist and are bound to ``other``
-    are preserved, and relations on ``self`` are discarded.
-    """
-    # TODO: proper support for database routing
-    s_model = type(self)
-
-    # Find all the objects than need to be deleted.
-    collector = EverythingCollector(using=using)
-    collector.collect([self])
-
-    for model, objects in six.iteritems(collector.data):
-        # find all potential keys which match our type
-        fields = set(
-            f.name for f in model._meta.fields
-            if isinstance(f, ForeignKey) and f.rel.to == s_model if f.rel.to
+            ],
+            max_value=self.count,
+            # The default update interval is every 0.1s,
+            # which for large migrations would easily logspam GoCD.
+            min_poll_interval=10,
         )
-        if not fields:
-            # the collector pulls in the self reference, so if it's our model
-            # we actually assume it's probably not related to itself, and its
-            # perfectly ok
-            if model == s_model:
-                continue
-            raise TypeError('Unable to determine related keys on %r' % model)
-
-        for obj in objects:
-            send_signals = not model._meta.auto_created
-
-            # find fields which need changed
-            update_kwargs = {}
-            for f_name in fields:
-                if getattr(obj, f_name) == self:
-                    update_kwargs[f_name] = other
-
-            if not update_kwargs:
-                # as before, if we're referencing ourself, this is ok
-                if obj == self:
-                    continue
-                raise ValueError('Mismatched row present in related results')
-
-            signal_kwargs = {
-                'sender': model,
-                'instance': obj,
-                'using': using,
-                'migrated': True,
-            }
-
-            if send_signals:
-                pre_delete.send(**signal_kwargs)
-                post_delete.send(**signal_kwargs)
-
-            for k, v in six.iteritems(update_kwargs):
-                setattr(obj, k, v)
-
-            if send_signals:
-                pre_save.send(created=True, **signal_kwargs)
-
-            try:
-                with transaction.atomic(using=using):
-                    model.objects.using(using).filter(pk=obj.pk).update(**update_kwargs)
-            except IntegrityError:
-                # duplicate key exists, destroy the relations
-                model.objects.using(using).filter(pk=obj.pk).delete()
-
-            if send_signals:
-                post_save.send(created=True, **signal_kwargs)
+        pbar.start()
+        for idx, item in enumerate(self.iterator):
+            yield item
+            # It's possible that we've exceeded the maxval, but instead
+            # of exploding on a ValueError, let's just cap it so we don't.
+            # this could happen if new rows were added between calculating `count()`
+            # and actually beginning iteration where we're iterating slightly more
+            # than we thought.
+            pbar.update(min(idx, self.count))
+        pbar.finish()
 
 
-def bulk_delete_objects(model, limit=10000, transaction_id=None,
-                        logger=None, partition_key=None, **filters):
+def bulk_delete_objects(
+    model, limit=10000, transaction_id=None, logger=None, partition_key=None, **filters
+):
     connection = connections[router.db_for_write(model)]
     quote_name = connection.ops.quote_name
 
@@ -295,51 +264,42 @@ def bulk_delete_objects(model, limit=10000, transaction_id=None,
 
     if partition_key:
         for column, value in partition_key.items():
-            partition_query.append('%s = %%s' % (quote_name(column), ))
+            partition_query.append(f"{quote_name(column)} = %s")
             params.append(value)
 
     for column, value in filters.items():
-        query.append('%s = %%s' % (quote_name(column), ))
-        params.append(value)
+        if column.endswith("__in"):
+            column, _ = column.split("__")
+            query.append(f"{quote_name(column)} = ANY(%s)")
+            params.append(list(value))
+        else:
+            query.append(f"{quote_name(column)} = %s")
+            params.append(value)
 
-    if db.is_postgres():
-        query = """
-            delete from %(table)s
-            where %(partition_query)s id = any(array(
-                select id
-                from %(table)s
-                where (%(query)s)
-                limit %(limit)d
-            ))
-        """ % dict(
-            partition_query=(' AND '.join(partition_query)) + (' AND ' if partition_query else ''),
-            query=' AND '.join(query),
-            table=model._meta.db_table,
-            limit=limit,
-        )
-    else:
-        if logger is not None:
-            logger.warning('Using slow deletion strategy due to unknown database')
-        has_more = False
-        for obj in model.objects.filter(**filters)[:limit]:
-            obj.delete()
-            has_more = True
-        return has_more
+    query_s = """
+        delete from %(table)s
+        where %(partition_query)s id = any(array(
+            select id
+            from %(table)s
+            where (%(query)s)
+            limit %(limit)d
+        ))
+    """ % dict(
+        partition_query=(" AND ".join(partition_query)) + (" AND " if partition_query else ""),
+        query=" AND ".join(query),
+        table=model._meta.db_table,
+        limit=limit,
+    )
 
     cursor = connection.cursor()
-    cursor.execute(query, params)
+    cursor.execute(query_s, params)
 
     has_more = cursor.rowcount > 0
 
     if has_more and logger is not None and _leaf_re.search(model.__name__) is None:
         logger.info(
-            'object.delete.bulk_executed',
-            extra=dict(
-                filters.items() + [
-                    ('model', model.__name__),
-                    ('transaction_id', transaction_id),
-                ]
-            )
+            "object.delete.bulk_executed",
+            extra=dict(filters, model=model.__name__, transaction_id=transaction_id),
         )
 
     return has_more

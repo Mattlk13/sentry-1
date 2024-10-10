@@ -1,24 +1,26 @@
-from __future__ import absolute_import
-
 from django import forms
 
-from sentry.models import Activity
+from sentry.models.activity import Activity
+from sentry.types.activity import ActivityType
 
 
 class NewNoteForm(forms.Form):
     text = forms.CharField(
-        widget=forms.Textarea(attrs={'rows': '1',
-                                     'placeholder': 'Type a note and press enter...'})
+        widget=forms.Textarea(attrs={"rows": "1", "placeholder": "Type a note and press enter..."})
     )
 
-    def save(self, group, user, event=None):
-        activity = Activity.objects.create(
+    def save(self, group, user):
+        qs = Activity.objects.filter(
             group=group,
-            project=group.project,
-            type=Activity.NOTE,
-            user=user,
-            data=self.cleaned_data
+            project_id=group.project_id,
+            user_id=user.id,
+            type=ActivityType.NOTE.value,
+            data=self.cleaned_data,
         )
-        activity.send_notification()
-
-        return activity
+        # Prevent duplicate comments, this is necessary for outbox based
+        # delivery to be idempotent
+        if qs.exists():
+            return
+        return Activity.objects.create_group_activity(
+            group, ActivityType.NOTE, user=user, data=self.cleaned_data
+        )

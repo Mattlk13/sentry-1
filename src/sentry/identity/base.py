@@ -1,38 +1,18 @@
-from __future__ import absolute_import, print_function
-
+import abc
 import logging
-from collections import namedtuple
 
 from sentry.pipeline import PipelineProvider
 
 
-class MigratingIdentityId(namedtuple('MigratingIdentityId', ['id', 'legacy_id'])):
-    """
-    MigratingIdentityId may be used in the ``id`` field of an identity
-    dictionary to facilitate migrating user identites from one identifying id
-    to another.
-    """
-    __slots__ = ()
-
-    def __unicode__(self):
-        # Default to id when coercing for query lookup
-        return self.id
-
-
-class Provider(PipelineProvider):
+class Provider(PipelineProvider, abc.ABC):
     """
     A provider indicates how identity authenticate should happen for a given service.
     """
 
-    # The unique identifier of the provider
-    key = None
-
-    # A human readable name for this provider
-    name = None
-
     def __init__(self, **config):
+        super().__init__()
         self.config = config
-        self.logger = logging.getLogger(u'sentry.identity.%s'.format(self.key))
+        self.logger = logging.getLogger(f"sentry.identity.{self.key}")
 
     def build_identity(self, state):
         """
@@ -44,7 +24,7 @@ class Provider(PipelineProvider):
         >>>     "id":     "foo@example.com",
         >>>     "email":  "foo@example.com",
         >>>     "name":   "Foo Bar",
-        >>>     "scopes": ['emaill', ...],
+        >>>     "scopes": ['email', ...],
         >>>     "data":   { ... },
         >>> }
 

@@ -1,13 +1,13 @@
-from __future__ import absolute_import
+from __future__ import annotations
 
-import six
-import sys
-import types
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Generic, Literal, Self, TypeVar, overload
 
-from sentry.utils.cache import memoize
+C = TypeVar("C")
+T = TypeVar("T")
 
 
-class Param(object):
+class Param(Generic[T]):
     """
     Argument declarations for Mediators.
 
@@ -16,7 +16,7 @@ class Param(object):
 
     Example Usage:
         >>> class Creator(Mediator):
-        >>>     name = Param(six.binary_type, default='example')
+        >>>     name = Param(str, default='example')
         >>>
         >>> c = Creator(name='foo')
         >>> c.name
@@ -29,7 +29,7 @@ class Param(object):
         >>> c = Creator(name=False)
         Traceback (most recent call last):
             ...
-        TypeError: `name` must be a <type 'six.binary_type'>
+        TypeError: `name` must be a <type 'str'>
 
     Type Validation:
         When a Mediator is instantiated, it validates each of it's Params. This
@@ -37,12 +37,12 @@ class Param(object):
         expected.
 
         >>> class Creator(Mediator):
-        >>>     name = Param(six.binary_type)
+        >>>     name = Param(str)
         >>>
         >>> c = Creator(name=False)
         Traceback (most recent call last):
             ...
-        TypeError: `name` must be a <type 'six.binary_type'>
+        TypeError: `name` must be a <type 'str'>
 
     Presence Validation:
         Without specifying otherwise, Params are assumed to be required. If
@@ -65,7 +65,7 @@ class Param(object):
         Declaration order DOES matter.
 
         >>> class Creator(Mediator):
-        >>>     name = Param(six.binary_type, default='Pete')
+        >>>     name = Param(str, default='Pete')
         >>>
         >>> c = Creator()
         >>> c.name
@@ -73,16 +73,44 @@ class Param(object):
 
         >>> class Creator(Mediator):
         >>>     user = Param(dict)
-        >>>     name = Param(six.binary_type, default=lambda self: self.user['name'])
+        >>>     name = Param(str, default=lambda self: self.user['name'])
     """
 
-    def __init__(self, type, **kwargs):
-        self._type = type
-        self.kwargs = kwargs
+    @overload
+    def __init__(
+        self: Param[T | None],
+        type: type[T],
+        *,
+        required: Literal[False],
+        default: T | Callable[..., T] | None = None,
+    ) -> None:
+        ...
+
+    @overload
+    def __init__(
+        self: Param[T],
+        type: type[T],
+        *,
+        required: bool = ...,
+        default: T | Callable[..., T] | None = None,
+    ) -> None:
+        ...
+
+    def __init__(
+        self,
+        type: type[T],
+        *,
+        default: T | Callable[..., T] | None = None,
+        required: bool = True,
+    ) -> None:
+        self.type = type
+        self._default = default
+        self.is_required = required
+        self.has_default = default is not None
 
     def setup(self, target, name):
         delattr(target, name)
-        setattr(target, u'_{}'.format(name), self)
+        setattr(target, f"_{name}", self)
 
     def validate(self, target, name, value):
         """
@@ -93,12 +121,10 @@ class Param(object):
             value = self.default(target)
 
         if self._missing_value(value):
-            raise AttributeError(u'Missing required param: `{}`'.format(name))
+            raise AttributeError(f"Missing required param: `{name}`")
 
         if self.is_required and not isinstance(value, self.type):
-            raise TypeError(u'`{}` must be a {}, received {}'.format(
-                name, self.type, type(value)
-            ))
+            raise TypeError(f"`{name}` must be a {self.type}, received {type(value)}")
 
         return True
 
@@ -106,54 +132,26 @@ class Param(object):
         """
         Evaluated default value, when given.
         """
-        default = value = self.kwargs.get('default')
+        default = value = self._default
 
-        if self.is_lambda_default:
+        if callable(default):
             value = default(target)
 
         return value
 
-    @memoize
-    def type(self):
-        if isinstance(self._type, six.string_types):
-            return self._eval_string_type()
-        return self._type
-
-    @memoize
-    def has_default(self):
-        return 'default' in self.kwargs
-
-    @memoize
-    def is_lambda_default(self):
-        return isinstance(self.kwargs.get('default'), types.LambdaType)
-
-    @memoize
-    def is_required(self):
-        if self.kwargs.get('required') is False:
-            return False
-        return True
-
-    def _eval_string_type(self):
-        """
-        Converts a class path in string form to the actual class object.
-
-        Example:
-            >>> self._type = 'sentry.models.Project'
-            >>> self._eval_string_type()
-            sentry.models.project.Project
-        """
-        mod, klass = self._type.rsplit('.', 1)
-        return getattr(sys.modules[mod], klass)
-
     def _missing_value(self, value):
         return self.is_required and value is None and not self.has_default
 
+    # these act as attributes after Mediator does its metaprogramming
+    if TYPE_CHECKING:
 
-def if_param(name):
-    def _if_param(func):
-        def wrapper(self, *args):
-            if not hasattr(self, name) or getattr(self, name) is None:
-                return
-            return func(self, *args)
-        return wrapper
-    return _if_param
+        @overload
+        def __get__(self, inst: None, owner: type[C]) -> Self:
+            ...
+
+        @overload
+        def __get__(self, inst: C, owner: type[C]) -> T:
+            ...
+
+        def __get__(self, inst: C | None, owner: type[C]) -> T | Self:
+            ...

@@ -1,59 +1,32 @@
-from __future__ import absolute_import
+from django.db.models import prefetch_related_objects
 
-import six
-
-from sentry.api.serializers import (
-    Serializer,
-    register,
-)
-from sentry.utils.snuba import SnubaTSResult
-from sentry.api.serializers import serialize
-from sentry.api.serializers.models.user import UserSerializer
-from sentry.api.serializers.snuba import SnubaTSResultSerializer
-from sentry.incidents.models import IncidentActivity
-from sentry.utils.db import attach_foreignkey
+from sentry.api.serializers import Serializer, register
+from sentry.incidents.models.incident import IncidentActivity
+from sentry.users.services.user.serial import serialize_generic_user
+from sentry.users.services.user.service import user_service
 
 
 @register(IncidentActivity)
 class IncidentActivitySerializer(Serializer):
     def get_attrs(self, item_list, user, **kwargs):
-        attach_foreignkey(item_list, IncidentActivity.incident, related=('organization',))
-        attach_foreignkey(item_list, IncidentActivity.event_stats_snapshot)
-        attach_foreignkey(item_list, IncidentActivity.user)
-        user_serializer = UserSerializer()
-        serialized_users = serialize(
-            set(item.user for item in item_list if item.user_id),
-            user=user,
-            serializer=user_serializer,
+        prefetch_related_objects(item_list, "incident__organization")
+        serialized_users = user_service.serialize_many(
+            filter={"user_ids": [i.user_id for i in item_list if i.user_id]},
+            as_user=serialize_generic_user(user),
         )
-        user_lookup = {user['id']: user for user in serialized_users}
-        return {item: {'user': user_lookup.get(six.text_type(item.user_id))} for item in item_list}
+        user_lookup = {user["id"]: user for user in serialized_users}
+        return {item: {"user": user_lookup.get(str(item.user_id))} for item in item_list}
 
-    def serialize(self, obj, attrs, user):
+    def serialize(self, obj, attrs, user, **kwargs):
         incident = obj.incident
 
-        event_stats = None
-        if obj.event_stats_snapshot:
-            serializer = SnubaTSResultSerializer(
-                obj.incident.organization,
-                None,
-                user,
-            )
-            event_stats = serializer.serialize(SnubaTSResult(
-                obj.event_stats_snapshot.snuba_values,
-                obj.event_stats_snapshot.start,
-                obj.event_stats_snapshot.end,
-                obj.event_stats_snapshot.period,
-            ))
-
         return {
-            'id': six.text_type(obj.id),
-            'incidentIdentifier': six.text_type(incident.identifier),
-            'user': attrs['user'],
-            'type': obj.type,
-            'value': obj.value,
-            'previousValue': obj.previous_value,
-            'comment': obj.comment,
-            'eventStats': event_stats,
-            'dateCreated': obj.date_added,
+            "id": str(obj.id),
+            "incidentIdentifier": str(incident.identifier),
+            "user": attrs["user"],
+            "type": obj.type,
+            "value": obj.value,
+            "previousValue": obj.previous_value,
+            "comment": obj.comment,
+            "dateCreated": obj.date_added,
         }

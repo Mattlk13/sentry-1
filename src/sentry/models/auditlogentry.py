@@ -1,359 +1,167 @@
-from __future__ import absolute_import, print_function
-import six
+from __future__ import annotations
+
+import logging
+import re
+from collections.abc import Mapping
+from typing import Any
 
 from django.db import models
 from django.utils import timezone
 
+from sentry.audit_log.services.log import AuditLogEvent
+from sentry.backup.scopes import RelocationScope
 from sentry.db.models import (
-    Model, BoundedPositiveIntegerField, FlexibleForeignKey, GzippedDictField, sane_repr
+    BoundedBigIntegerField,
+    BoundedPositiveIntegerField,
+    FlexibleForeignKey,
+    GzippedDictField,
+    Model,
+    sane_repr,
 )
-from sentry.utils.strings import truncatechars
+from sentry.db.models.base import control_silo_model
+from sentry.db.models.fields.hybrid_cloud_foreign_key import HybridCloudForeignKey
+from sentry.users.services.user.service import user_service
+
+MAX_ACTOR_LABEL_LENGTH = 64
+
+logger = logging.getLogger(__name__)
 
 
-class AuditLogEntryEvent(object):
-    MEMBER_INVITE = 1
-    MEMBER_ADD = 2
-    MEMBER_ACCEPT = 3
-    MEMBER_EDIT = 4
-    MEMBER_REMOVE = 5
-    MEMBER_JOIN_TEAM = 6
-    MEMBER_LEAVE_TEAM = 7
-    MEMBER_PENDING = 8
-
-    ORG_ADD = 10
-    ORG_EDIT = 11
-    ORG_REMOVE = 12
-    ORG_RESTORE = 13
-
-    TEAM_ADD = 20
-    TEAM_EDIT = 21
-    TEAM_REMOVE = 22
-
-    PROJECT_ADD = 30
-    PROJECT_EDIT = 31
-    PROJECT_REMOVE = 32
-    PROJECT_SET_PUBLIC = 33
-    PROJECT_SET_PRIVATE = 34
-    PROJECT_REQUEST_TRANSFER = 35
-    PROJECT_ACCEPT_TRANSFER = 36
-    PROJECT_ENABLE = 37
-    PROJECT_DISABLE = 38
-
-    TAGKEY_REMOVE = 40
-
-    PROJECTKEY_ADD = 50
-    PROJECTKEY_EDIT = 51
-    PROJECTKEY_REMOVE = 52
-    PROJECTKEY_ENABLE = 53
-    PROJECTKEY_DISABLE = 53
-
-    SSO_ENABLE = 60
-    SSO_DISABLE = 61
-    SSO_EDIT = 62
-    SSO_IDENTITY_LINK = 63
-
-    APIKEY_ADD = 70
-    APIKEY_EDIT = 71
-    APIKEY_REMOVE = 72
-
-    RULE_ADD = 80
-    RULE_EDIT = 81
-    RULE_REMOVE = 82
-
-    SET_ONDEMAND = 90
-    TRIAL_STARTED = 91
-    PLAN_CHANGED = 92
-    PLAN_CANCELLED = 93
-
-    SERVICEHOOK_ADD = 100
-    SERVICEHOOK_EDIT = 101
-    SERVICEHOOK_REMOVE = 102
-    SERVICEHOOK_ENABLE = 103
-    SERVICEHOOK_DISABLE = 104
-
-    INTEGRATION_ADD = 110
-    INTEGRATION_EDIT = 111
-    INTEGRATION_REMOVE = 112
-
-    SENTRY_APP_ADD = 113
-    # SENTRY_APP_EDIT = 114
-    SENTRY_APP_REMOVE = 115
-    SENTRY_APP_INSTALL = 116
-    SENTRY_APP_UNINSTALL = 117
-
-    MONITOR_ADD = 120
-    MONITOR_EDIT = 121
-    MONITOR_REMOVE = 122
-
-    INTERNAL_INTEGRATION_ADD = 130
-
-    INTERNAL_INTEGRATION_ADD_TOKEN = 135
+def is_scim_token_actor(actor):
+    scim_prefix = "scim-internal-integration-"
+    return scim_prefix in actor.get_display_name()
 
 
+def format_scim_token_actor_name(actor):
+    scim_regex = re.compile(
+        r".*([0-9a-fA-F]{6})\-[0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{7}"
+    )
+    scim_match = re.match(scim_regex, actor.get_display_name())
+    assert scim_match is not None
+    uuid_prefix = scim_match[1]
+    return f"SCIM Internal Integration ({uuid_prefix})"
+
+
+@control_silo_model
 class AuditLogEntry(Model):
-    __core__ = False
+    __relocation_scope__ = RelocationScope.Excluded
 
-    organization = FlexibleForeignKey('sentry.Organization')
-    actor_label = models.CharField(max_length=64, null=True, blank=True)
+    organization_id = HybridCloudForeignKey("sentry.Organization", on_delete="CASCADE")
+    actor_label = models.CharField(max_length=MAX_ACTOR_LABEL_LENGTH, null=True, blank=True)
     # if the entry was created via a user
-    actor = FlexibleForeignKey('sentry.User', related_name='audit_actors', null=True, blank=True)
+    actor = FlexibleForeignKey(
+        "sentry.User", related_name="audit_actors", null=True, blank=True, on_delete=models.SET_NULL
+    )
     # if the entry was created via an api key
-    actor_key = FlexibleForeignKey('sentry.ApiKey', null=True, blank=True)
-    target_object = BoundedPositiveIntegerField(null=True)
+    actor_key = FlexibleForeignKey("sentry.ApiKey", null=True, blank=True)
+    target_object = BoundedBigIntegerField(null=True)
     target_user = FlexibleForeignKey(
-        'sentry.User', null=True, blank=True, related_name='audit_targets'
+        "sentry.User",
+        null=True,
+        blank=True,
+        related_name="audit_targets",
+        on_delete=models.SET_NULL,
     )
     # TODO(dcramer): we want to compile this mapping into JSX for the UI
-    event = BoundedPositiveIntegerField(
-        choices=(
-            # We emulate github a bit with event naming
-            (AuditLogEntryEvent.MEMBER_INVITE, 'member.invite'),
-            (AuditLogEntryEvent.MEMBER_ADD, 'member.add'),
-            (AuditLogEntryEvent.MEMBER_ACCEPT, 'member.accept-invite'),
-            (AuditLogEntryEvent.MEMBER_REMOVE, 'member.remove'),
-            (AuditLogEntryEvent.MEMBER_EDIT, 'member.edit'),
-            (AuditLogEntryEvent.MEMBER_JOIN_TEAM, 'member.join-team'),
-            (AuditLogEntryEvent.MEMBER_LEAVE_TEAM, 'member.leave-team'),
-            (AuditLogEntryEvent.MEMBER_PENDING, 'member.pending'),
-            (AuditLogEntryEvent.TEAM_ADD, 'team.create'),
-            (AuditLogEntryEvent.TEAM_EDIT, 'team.edit'),
-            (AuditLogEntryEvent.TEAM_REMOVE, 'team.remove'),
-            (AuditLogEntryEvent.PROJECT_ADD, 'project.create'),
-            (AuditLogEntryEvent.PROJECT_EDIT, 'project.edit'),
-            (AuditLogEntryEvent.PROJECT_REMOVE, 'project.remove'),
-            (AuditLogEntryEvent.PROJECT_SET_PUBLIC, 'project.set-public'),
-            (AuditLogEntryEvent.PROJECT_SET_PRIVATE, 'project.set-private'),
-            (AuditLogEntryEvent.PROJECT_REQUEST_TRANSFER, 'project.request-transfer'),
-            (AuditLogEntryEvent.PROJECT_ACCEPT_TRANSFER, 'project.accept-transfer'),
-            (AuditLogEntryEvent.PROJECT_ENABLE, 'project.enable'),
-            (AuditLogEntryEvent.PROJECT_DISABLE, 'project.disable'),
-            (AuditLogEntryEvent.ORG_ADD, 'org.create'),
-            (AuditLogEntryEvent.ORG_EDIT, 'org.edit'),
-            (AuditLogEntryEvent.ORG_REMOVE, 'org.remove'),
-            (AuditLogEntryEvent.ORG_RESTORE, 'org.restore'),
-            (AuditLogEntryEvent.TAGKEY_REMOVE, 'tagkey.remove'),
-            (AuditLogEntryEvent.PROJECTKEY_ADD, 'projectkey.create'),
-            (AuditLogEntryEvent.PROJECTKEY_EDIT, 'projectkey.edit'),
-            (AuditLogEntryEvent.PROJECTKEY_REMOVE, 'projectkey.remove'),
-            (AuditLogEntryEvent.PROJECTKEY_ENABLE, 'projectkey.enable'),
-            (AuditLogEntryEvent.PROJECTKEY_DISABLE, 'projectkey.disable'),
-            (AuditLogEntryEvent.SSO_ENABLE, 'sso.enable'),
-            (AuditLogEntryEvent.SSO_DISABLE, 'sso.disable'),
-            (AuditLogEntryEvent.SSO_EDIT, 'sso.edit'),
-            (AuditLogEntryEvent.SSO_IDENTITY_LINK, 'sso-identity.link'),
-            (AuditLogEntryEvent.APIKEY_ADD, 'api-key.create'),
-            (AuditLogEntryEvent.APIKEY_EDIT, 'api-key.edit'),
-            (AuditLogEntryEvent.APIKEY_REMOVE, 'api-key.remove'),
-            (AuditLogEntryEvent.RULE_ADD, 'rule.create'),
-            (AuditLogEntryEvent.RULE_EDIT, 'rule.edit'),
-            (AuditLogEntryEvent.RULE_REMOVE, 'rule.remove'),
-
-            (AuditLogEntryEvent.SERVICEHOOK_ADD, 'serivcehook.create'),
-            (AuditLogEntryEvent.SERVICEHOOK_EDIT, 'serivcehook.edit'),
-            (AuditLogEntryEvent.SERVICEHOOK_REMOVE, 'serivcehook.remove'),
-            (AuditLogEntryEvent.SERVICEHOOK_ENABLE, 'serivcehook.enable'),
-            (AuditLogEntryEvent.SERVICEHOOK_DISABLE, 'serivcehook.disable'),
-            (AuditLogEntryEvent.INTEGRATION_ADD, 'integration.add'),
-            (AuditLogEntryEvent.INTEGRATION_EDIT, 'integration.edit'),
-            (AuditLogEntryEvent.INTEGRATION_REMOVE, 'integration.remove'),
-            (AuditLogEntryEvent.SENTRY_APP_ADD, 'sentry-app.add'),
-            (AuditLogEntryEvent.SENTRY_APP_REMOVE, 'sentry-app.remove'),
-            (AuditLogEntryEvent.SENTRY_APP_INSTALL, 'sentry-app.install'),
-            (AuditLogEntryEvent.SENTRY_APP_UNINSTALL, 'sentry-app.uninstall'),
-            (AuditLogEntryEvent.INTERNAL_INTEGRATION_ADD, 'internal-integration.create'),
-            (AuditLogEntryEvent.INTERNAL_INTEGRATION_ADD_TOKEN, 'internal-integration.add-token'),
-
-            (AuditLogEntryEvent.SET_ONDEMAND, 'ondemand.edit'),
-            (AuditLogEntryEvent.TRIAL_STARTED, 'trial.started'),
-            (AuditLogEntryEvent.PLAN_CHANGED, 'plan.changed'),
-            (AuditLogEntryEvent.PLAN_CANCELLED, 'plan.cancelled'),
-
-
-        )
-    )
+    event = BoundedPositiveIntegerField()
     ip_address = models.GenericIPAddressField(null=True, unpack_ipv4=True)
-    data = GzippedDictField()
+    data: models.Field[Mapping[str, Any] | None, dict[str, Any]] = GzippedDictField()
     datetime = models.DateTimeField(default=timezone.now)
 
     class Meta:
-        app_label = 'sentry'
-        db_table = 'sentry_auditlogentry'
+        app_label = "sentry"
+        db_table = "sentry_auditlogentry"
+        indexes = [
+            models.Index(fields=["organization_id", "datetime"]),
+            models.Index(fields=["organization_id", "event", "datetime"]),
+        ]
 
-    __repr__ = sane_repr('organization_id', 'type')
+    __repr__ = sane_repr("organization_id", "type")
 
     def save(self, *args, **kwargs):
+        # trim label to the max length
+        self._apply_actor_label()
+        self.actor_label = self.actor_label[:MAX_ACTOR_LABEL_LENGTH] if self.actor_label else ""
+        super().save(*args, **kwargs)
+
+    def _apply_actor_label(self):
         if not self.actor_label:
-            assert self.actor or self.actor_key
-            if self.actor:
-                self.actor_label = self.actor.username
-            else:
+            assert self.actor_id or self.actor_key or self.ip_address
+            if self.actor_id:
+                # Fetch user by RPC service as
+                # Audit logs are often created in regions.
+                user = user_service.get_user(self.actor_id)
+                if user:
+                    self.actor_label = user.username
+            elif self.actor_key:
+                # TODO(hybridcloud) This requires an RPC service.
                 self.actor_label = self.actor_key.key
-        super(AuditLogEntry, self).save(*args, **kwargs)
+
+        # Fallback to IP address if user or actor label not available
+        if not self.actor_label:
+            self.actor_label = self.ip_address or ""
+
+    def as_event(self) -> AuditLogEvent:
+        """
+        Serializes a potential audit log database entry as a hybrid cloud event that should be deserialized and
+        loaded via `from_event` as faithfully as possible.
+        """
+        if self.actor_label is not None:
+            self.actor_label = self.actor_label[:MAX_ACTOR_LABEL_LENGTH]
+        return AuditLogEvent(
+            actor_label=self.actor_label,
+            organization_id=int(
+                self.organization_id
+            ),  # prefer raising NoneType here over actually passing through
+            date_added=self.datetime or timezone.now(),
+            actor_user_id=self.actor_id and self.actor_id,
+            target_object_id=self.target_object,
+            ip_address=self.ip_address and str(self.ip_address),
+            event_id=self.event and int(self.event),
+            target_user_id=self.target_user_id,
+            data=self.data,
+            actor_key_id=self.actor_key_id,
+        )
+
+    @classmethod
+    def from_event(cls, event: AuditLogEvent) -> AuditLogEntry:
+        """
+        Deserializes a kafka event object into a control silo database item.  Keep in mind that these event objects
+        could have been created from previous code versions -- the events are stored on an async queue for indefinite
+        delivery and from possibly older code versions.
+        """
+        from sentry.users.models.user import User
+
+        if event.actor_label:
+            label = event.actor_label[:MAX_ACTOR_LABEL_LENGTH]
+        else:
+            if event.actor_user_id:
+                try:
+                    label = User.objects.get(id=event.actor_user_id).username
+                except User.DoesNotExist:
+                    label = None
+            else:
+                label = None
+        return AuditLogEntry(
+            organization_id=event.organization_id,
+            datetime=event.date_added,
+            actor_id=event.actor_user_id,
+            target_object=event.target_object_id,
+            ip_address=event.ip_address,
+            event=event.event_id,
+            data=event.data,
+            actor_label=label,
+            target_user_id=event.target_user_id,
+            actor_key_id=event.actor_key_id,
+        )
 
     def get_actor_name(self):
         if self.actor:
+            # fix display name if needed
+            if is_scim_token_actor(self.actor):
+                return format_scim_token_actor_name(self.actor)
+
             return self.actor.get_display_name()
         elif self.actor_key:
-            return self.actor_key.key + ' (api key)'
+            return self.actor_key.key + " (api key)"
         return self.actor_label
-
-    def get_note(self):
-        if self.event == AuditLogEntryEvent.MEMBER_INVITE:
-            return 'invited member %s' % (self.data['email'], )
-        elif self.event == AuditLogEntryEvent.MEMBER_ADD:
-            if self.target_user == self.actor:
-                return 'joined the organization'
-            return 'added member %s' % (self.target_user.get_display_name(), )
-        elif self.event == AuditLogEntryEvent.MEMBER_ACCEPT:
-            return 'accepted the membership invite'
-        elif self.event == AuditLogEntryEvent.MEMBER_REMOVE:
-            if self.target_user == self.actor:
-                return 'left the organization'
-            return 'removed member %s' % (
-                self.data.get('email') or self.target_user.get_display_name(),
-            )
-        elif self.event == AuditLogEntryEvent.MEMBER_EDIT:
-            return 'edited member %s (role: %s, teams: %s)' % (
-                self.data.get('email') or self.target_user.get_display_name(),
-                self.data.get('role') or 'N/A',
-                ', '.join(six.text_type(x) for x in self.data.get('team_slugs', [])) or 'N/A',
-            )
-        elif self.event == AuditLogEntryEvent.MEMBER_JOIN_TEAM:
-            if self.target_user == self.actor:
-                return 'joined team %s' % (self.data['team_slug'], )
-            return 'added %s to team %s' % (
-                self.data.get('email') or self.target_user.get_display_name(),
-                self.data['team_slug'],
-            )
-        elif self.event == AuditLogEntryEvent.MEMBER_LEAVE_TEAM:
-            if self.target_user == self.actor:
-                return 'left team %s' % (self.data['team_slug'], )
-            return 'removed %s from team %s' % (
-                self.data.get('email') or self.target_user.get_display_name(),
-                self.data['team_slug'],
-            )
-        elif self.event == AuditLogEntryEvent.MEMBER_PENDING:
-            return 'required member %s to setup 2FA' % (
-                self.data.get('email') or self.target_user.get_display_name(),
-            )
-
-        elif self.event == AuditLogEntryEvent.ORG_ADD:
-            return 'created the organization'
-        elif self.event == AuditLogEntryEvent.ORG_EDIT:
-            return 'edited the organization setting: ' + (', '.join(u'{} {}'.format(k, v)
-                                                                    for k, v in self.data.items()))
-        elif self.event == AuditLogEntryEvent.ORG_REMOVE:
-            return 'removed the organization'
-        elif self.event == AuditLogEntryEvent.ORG_RESTORE:
-            return 'restored the organization'
-
-        elif self.event == AuditLogEntryEvent.TEAM_ADD:
-            return 'created team %s' % (self.data['slug'], )
-        elif self.event == AuditLogEntryEvent.TEAM_EDIT:
-            return 'edited team %s' % (self.data['slug'], )
-        elif self.event == AuditLogEntryEvent.TEAM_REMOVE:
-            return 'removed team %s' % (self.data['slug'], )
-
-        elif self.event == AuditLogEntryEvent.PROJECT_ADD:
-            return 'created project %s' % (self.data['slug'], )
-        elif self.event == AuditLogEntryEvent.PROJECT_EDIT:
-            return 'edited project settings ' + (' '.join([' in %s to %s' % (key, value)
-                                                           for (key, value) in six.iteritems(self.data)]))
-        elif self.event == AuditLogEntryEvent.PROJECT_REMOVE:
-            return 'removed project %s' % (self.data['slug'], )
-        elif self.event == AuditLogEntryEvent.PROJECT_REQUEST_TRANSFER:
-            return 'requested to transfer project %s' % (self.data['slug'], )
-        elif self.event == AuditLogEntryEvent.PROJECT_ACCEPT_TRANSFER:
-            return 'accepted transfer of project %s' % (self.data['slug'], )
-        elif self.event == AuditLogEntryEvent.PROJECT_ENABLE:
-            if isinstance(self.data['state'], set):
-                return 'enabled project filter %s' % (self.data['state'], )
-            return 'enabled project filter %s' % (', '.join(self.data["state"]),)
-        elif self.event == AuditLogEntryEvent.PROJECT_DISABLE:
-            if isinstance(self.data['state'], set):
-                return 'disabled project filter %s' % (self.data['state'], )
-            return 'disabled project filter %s' % (', '.join(self.data["state"]),)
-
-        elif self.event == AuditLogEntryEvent.TAGKEY_REMOVE:
-            return 'removed tags matching %s = *' % (self.data['key'], )
-
-        elif self.event == AuditLogEntryEvent.PROJECTKEY_ADD:
-            return 'added project key %s' % (self.data['public_key'], )
-        elif self.event == AuditLogEntryEvent.PROJECTKEY_EDIT:
-            return 'edited project key %s' % (self.data['public_key'], )
-        elif self.event == AuditLogEntryEvent.PROJECTKEY_REMOVE:
-            return 'removed project key %s' % (self.data['public_key'], )
-        elif self.event == AuditLogEntryEvent.PROJECTKEY_ENABLE:
-            return 'enabled project key %s' % (self.data['public_key'], )
-        elif self.event == AuditLogEntryEvent.PROJECTKEY_DISABLE:
-            return 'disabled project key %s' % (self.data['public_key'], )
-
-        elif self.event == AuditLogEntryEvent.SSO_ENABLE:
-            return 'enabled sso (%s)' % (self.data['provider'], )
-        elif self.event == AuditLogEntryEvent.SSO_DISABLE:
-            return 'disabled sso (%s)' % (self.data['provider'], )
-        elif self.event == AuditLogEntryEvent.SSO_EDIT:
-            return 'edited sso settings: ' + (', '.join(u'{} {}'.format(k, v)
-                                                        for k, v in self.data.items()))
-        elif self.event == AuditLogEntryEvent.SSO_IDENTITY_LINK:
-            return 'linked their account to a new identity'
-
-        elif self.event == AuditLogEntryEvent.APIKEY_ADD:
-            return 'added api key %s' % (self.data['label'], )
-        elif self.event == AuditLogEntryEvent.APIKEY_EDIT:
-            return 'edited api key %s' % (self.data['label'], )
-        elif self.event == AuditLogEntryEvent.APIKEY_REMOVE:
-            return 'removed api key %s' % (self.data['label'], )
-
-        elif self.event == AuditLogEntryEvent.RULE_ADD:
-            return 'added rule "%s"' % (self.data['label'], )
-        elif self.event == AuditLogEntryEvent.RULE_EDIT:
-            return 'edited rule "%s"' % (self.data['label'], )
-        elif self.event == AuditLogEntryEvent.RULE_REMOVE:
-            return 'removed rule "%s"' % (self.data['label'], )
-
-        elif self.event == AuditLogEntryEvent.SET_ONDEMAND:
-            if self.data['ondemand'] == -1:
-                return 'changed on-demand spend to unlimited'
-            return 'changed on-demand max spend to $%d' % (self.data['ondemand'] / 100, )
-        elif self.event == AuditLogEntryEvent.TRIAL_STARTED:
-            return 'started trial'
-        elif self.event == AuditLogEntryEvent.PLAN_CHANGED:
-            return 'changed plan to %s' % (self.data['plan_name'], )
-        elif self.event == AuditLogEntryEvent.PLAN_CANCELLED:
-            return 'cancelled plan'
-
-        elif self.event == AuditLogEntryEvent.SERVICEHOOK_ADD:
-            return 'added a service hook for "%s"' % (truncatechars(self.data['url'], 64), )
-        elif self.event == AuditLogEntryEvent.SERVICEHOOK_EDIT:
-            return 'edited the service hook for "%s"' % (truncatechars(self.data['url'], 64), )
-        elif self.event == AuditLogEntryEvent.SERVICEHOOK_REMOVE:
-            return 'removed the service hook for "%s"' % (truncatechars(self.data['url'], 64), )
-        elif self.event == AuditLogEntryEvent.SERVICEHOOK_ENABLE:
-            return 'enabled theservice hook for "%s"' % (truncatechars(self.data['url'], 64), )
-        elif self.event == AuditLogEntryEvent.SERVICEHOOK_DISABLE:
-            return 'disabled the service hook for "%s"' % (truncatechars(self.data['url'], 64), )
-
-        elif self.event == AuditLogEntryEvent.INTEGRATION_ADD:
-            return 'enabled integration %s for project %s' % (
-                self.data['integration'], self.data['project'])
-        elif self.event == AuditLogEntryEvent.INTEGRATION_EDIT:
-            return 'edited integration %s for project %s' % (
-                self.data['integration'], self.data['project'])
-        elif self.event == AuditLogEntryEvent.INTEGRATION_REMOVE:
-            return 'disabled integration %s from project %s' % (
-                self.data['integration'], self.data['project'])
-
-        elif self.event == AuditLogEntryEvent.SENTRY_APP_ADD:
-            return 'created sentry app %s' % (self.data['sentry_app'])
-        elif self.event == AuditLogEntryEvent.SENTRY_APP_REMOVE:
-            return 'removed sentry app %s' % (self.data['sentry_app'])
-        elif self.event == AuditLogEntryEvent.SENTRY_APP_INSTALL:
-            return 'installed sentry app %s' % (self.data['sentry_app'])
-        elif self.event == AuditLogEntryEvent.SENTRY_APP_UNINSTALL:
-            return 'uninstalled sentry app %s' % (self.data['sentry_app'])
-        elif self.event == AuditLogEntryEvent.INTERNAL_INTEGRATION_ADD_TOKEN:
-            return 'created a token for internal integration %s' % (
-                self.data['sentry_app'])
-
-        return ''

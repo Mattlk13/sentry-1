@@ -1,10 +1,10 @@
-from __future__ import absolute_import
+from django.http import HttpRequest
 
-from sentry.models import Activity
+from sentry.types.activity import ActivityType
 
 from .mail import ActivityMailDebugView
 
 
 class DebugResolvedEmailView(ActivityMailDebugView):
-    def get_activity(self, request, event):
-        return {'type': Activity.SET_RESOLVED}
+    def get_activity(self, request: HttpRequest, event):
+        return {"type": ActivityType.SET_RESOLVED.value}
