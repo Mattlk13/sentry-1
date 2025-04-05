@@ -1,3 +1,5 @@
+import {OrganizationFixture} from 'sentry-fixture/organization';
+
 import {render, screen} from 'sentry-test/reactTestingLibrary';
 
 import {DurationUnit} from 'sentry/utils/discover/fields';
@@ -7,10 +9,10 @@ describe('ExploreCharts', () => {
   it('renders the progressive loading indicator when the widget is progressively loading', async () => {
     const mockTimeseriesResult = {
       data: {
-        'avg(span.duration)': [
+        'count(span.duration)': [
           {
             data: [{timestamp: '2021-01-01', value: 123.0}],
-            field: 'avg(span.duration)',
+            field: 'count(span.duration)',
             meta: {type: 'duration', unit: DurationUnit.MILLISECOND},
           },
         ],
@@ -26,7 +28,12 @@ describe('ExploreCharts', () => {
         query={''}
         timeseriesResult={mockTimeseriesResult}
         isProgressivelyLoading
-      />
+      />,
+      {
+        organization: OrganizationFixture({
+          features: ['visibility-explore-progressive-loading'],
+        }),
+      }
     );
 
     expect(

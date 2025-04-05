@@ -52,7 +52,7 @@ interface ReadablePageParams {
   title?: string;
 }
 
-interface WritablePageParams {
+export interface WritablePageParams {
   dataset?: DiscoverDatasets | null;
   fields?: string[] | null;
   groupBys?: string[] | null;
@@ -136,9 +136,7 @@ export function PageParamsProvider({children}: PageParamsProviderProps) {
     };
   }, [location, organization]);
 
-  return (
-    <PageParamsContext.Provider value={pageParams}>{children}</PageParamsContext.Provider>
-  );
+  return <PageParamsContext value={pageParams}>{children}</PageParamsContext>;
 }
 
 export function useExplorePageParams(): ReadablePageParams {

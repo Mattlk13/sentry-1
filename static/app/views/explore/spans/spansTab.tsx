@@ -1,4 +1,4 @@
-import {useMemo, useState} from 'react';
+import {useEffect, useMemo, useState} from 'react';
 import styled from '@emotion/styled';
 import * as Sentry from '@sentry/react';
 
@@ -34,12 +34,16 @@ import SchemaHintsList, {
   SCHEMA_HINTS_DRAWER_WIDTH,
   SchemaHintsSection,
 } from 'sentry/views/explore/components/schemaHintsList';
+import {SchemaHintsSources} from 'sentry/views/explore/components/schemaHintsUtils/schemaHintsListOrder';
 import {
   PageParamsProvider,
   useExploreDataset,
+  useExploreFields,
+  useExploreId,
   useExploreMode,
   useExploreQuery,
   useExploreVisualizes,
+  useSetExplorePageParams,
   useSetExploreQuery,
 } from 'sentry/views/explore/contexts/pageParamsContext';
 import {Mode} from 'sentry/views/explore/contexts/pageParamsContext/mode';
@@ -53,7 +57,9 @@ import {useExploreAggregatesTable} from 'sentry/views/explore/hooks/useExploreAg
 import {useExploreSpansTable} from 'sentry/views/explore/hooks/useExploreSpansTable';
 import {useExploreTimeseries} from 'sentry/views/explore/hooks/useExploreTimeseries';
 import {useExploreTracesTable} from 'sentry/views/explore/hooks/useExploreTracesTable';
+import {SAMPLING_MODE} from 'sentry/views/explore/hooks/useProgressiveQuery';
 import {Tab, useTab} from 'sentry/views/explore/hooks/useTab';
+import {useVisitQuery} from 'sentry/views/explore/hooks/useVisitQuery';
 import {ExploreTables} from 'sentry/views/explore/tables';
 import {ExploreToolbar} from 'sentry/views/explore/toolbar';
 import {
@@ -90,6 +96,16 @@ export function SpansTabContentImpl({
 
   const query = useExploreQuery();
   const setQuery = useSetExploreQuery();
+  const fields = useExploreFields();
+  const setExplorePageParams = useSetExplorePageParams();
+
+  const id = useExploreId();
+  const visitQuery = useVisitQuery();
+  useEffect(() => {
+    if (defined(id)) {
+      visitQuery(id);
+    }
+  }, [id, visitQuery]);
 
   const isSchemaHintsDrawerOpenOnLargeScreen = useSchemaHintsOnLargeScreen();
 
@@ -133,13 +149,12 @@ export function SpansTabContentImpl({
   });
 
   const {
-    timeseriesResult,
+    result: timeseriesResult,
     canUsePreviousResults,
-    fidelity: timeseriesFidelity,
+    samplingMode: timeseriesSamplingMode,
   } = useExploreTimeseries({
     query,
     enabled: isAllowedSelection,
-    queryMode: 'serial',
   });
 
   const confidences = useMemo(
@@ -182,6 +197,14 @@ export function SpansTabContentImpl({
         ? spansTableResult.result.isPending
         : tracesTableResult.result.isPending;
 
+  const tableIsProgressivelyLoading =
+    organization.features.includes('visibility-explore-progressive-loading') &&
+    (queryType === 'samples'
+      ? spansTableResult.samplingMode !== SAMPLING_MODE.BEST_EFFORT
+      : queryType === 'aggregate'
+        ? aggregatesTableResult.samplingMode !== SAMPLING_MODE.BEST_EFFORT
+        : false);
+
   return (
     <Body
       withToolbar={expanded}
@@ -209,6 +232,7 @@ export function SpansTabContentImpl({
             initialQuery={query}
             onSearch={setQuery}
             searchSource="explore"
+            submitOnFilterChange
           />
         ) : (
           <EAPSpanSearchQueryBuilder
@@ -235,6 +259,7 @@ export function SpansTabContentImpl({
             }
             numberTags={numberTags}
             stringTags={stringTags}
+            submitOnFilterChange
           />
         )}
       </TopSection>
@@ -248,7 +273,9 @@ export function SpansTabContentImpl({
             stringTags={stringTags}
             isLoading={numberTagsLoading || stringTagsLoading}
             exploreQuery={query}
-            setExploreQuery={setQuery}
+            source={SchemaHintsSources.EXPLORE}
+            tableColumns={fields}
+            setPageParams={setExplorePageParams}
           />
         </SchemaHintsSection>
       </Feature>
@@ -265,7 +292,8 @@ export function SpansTabContentImpl({
             timeseriesResult={timeseriesResult}
             isProgressivelyLoading={
               organization.features.includes('visibility-explore-progressive-loading') &&
-              timeseriesFidelity !== 'high'
+              defined(timeseriesSamplingMode) &&
+              timeseriesSamplingMode !== SAMPLING_MODE.BEST_EFFORT
             }
           />
           <ExploreTables
@@ -275,6 +303,7 @@ export function SpansTabContentImpl({
             confidences={confidences}
             samplesTab={samplesTab}
             setSamplesTab={setSamplesTab}
+            isProgressivelyLoading={tableIsProgressivelyLoading}
           />
           <Toggle>
             <StyledButton

@@ -131,6 +131,7 @@ class OrganizationEventsEndpointBase(OrganizationEndpoint):
                 )
 
             filter_params = self.get_filter_params(request, organization)
+            query = request.GET.get("query", "")
             if quantize_date_params:
                 filter_params = self.quantize_date_params(request, filter_params)
             params = SnubaParams(
@@ -143,6 +144,7 @@ class OrganizationEventsEndpointBase(OrganizationEndpoint):
                 ),
                 teams=self.get_teams(request, organization),
                 organization=organization,
+                query_string=query,
             )
 
             if check_global_views:
@@ -427,6 +429,7 @@ class OrganizationEventsV2EndpointBase(OrganizationEventsEndpointBase):
     def get_rollup(
         self, request: Request, snuba_params: SnubaParams, top_events: int, use_rpc: bool
     ) -> int:
+        """TODO: we should eventually rely on `SnubaParams.granularity_secs` instead"""
         try:
             rollup = get_rollup_from_request(
                 request,
@@ -497,6 +500,7 @@ class OrganizationEventsV2EndpointBase(OrganizationEventsEndpointBase):
                         return {"data": []}
 
                 rollup = self.get_rollup(request, snuba_params, top_events, use_rpc)
+                snuba_params.granularity_secs = rollup
                 self.validate_comparison_delta(comparison_delta, snuba_params, organization)
 
                 query_columns = get_query_columns(columns, rollup)

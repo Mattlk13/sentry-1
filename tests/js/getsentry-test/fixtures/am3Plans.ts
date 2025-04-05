@@ -9,13 +9,13 @@ const AM3_CHECKOUT_CATEGORIES = [
   'spans',
   'uptime',
 ]
-const AM3_CATEGORIES = [...AM3_CHECKOUT_CATEGORIES, 'profileDuration'];
+const AM3_CATEGORIES = [...AM3_CHECKOUT_CATEGORIES, 'profileDuration', 'profileDurationUI'];
 
 const AM3_DS_CHECKOUT_CATEGORIES = [
   ...AM3_CHECKOUT_CATEGORIES,
   'spansIndexed'
 ]
-const AM3_DS_CATEGORIES = [...AM3_DS_CHECKOUT_CATEGORIES, 'profileDuration']
+const AM3_DS_CATEGORIES = [...AM3_DS_CHECKOUT_CATEGORIES, 'profileDuration', 'profileDurationUI']
 
 const AM3_CATEGORY_DISPLAY_NAMES = {
   errors: {singular: 'error', plural: 'errors'},
@@ -23,7 +23,8 @@ const AM3_CATEGORY_DISPLAY_NAMES = {
   attachments: {singular: 'attachment', plural: 'attachments'},
   monitorSeats: {singular: 'cron monitor', plural: 'cron monitors'},
   spans: {plural: 'spans', singular: 'span'},
-  profileDuration: {plural: 'profile hours', singular: 'profile hour'},
+  profileDuration: {plural: 'continuous profile hours', singular: 'continuous profile hour'},
+  profileDurationUI: {plural: 'UI profile hours', singular: 'UI profile hour'},
   uptime: {singular: 'uptime monitor', plural: 'uptime monitors'},
 };
 
@@ -100,6 +101,8 @@ const AM3_DS_FEATURES = [
   'dynamic-sampling-custom',
 ];
 
+const BUDGET_TERM = 'pay-as-you-go';
+
 const AM3_PLANS: Record<string, Plan> = {
   am3_business: {
     id: 'am3_business',
@@ -126,6 +129,7 @@ const AM3_PLANS: Record<string, Plan> = {
     availableCategories: AM3_CATEGORIES,
     onDemandCategories: AM3_CATEGORIES,
     hasOnDemandModes: false,
+    budgetTerm: BUDGET_TERM,
     planCategories: {
       errors: [
         {
@@ -661,7 +665,15 @@ const AM3_PLANS: Record<string, Plan> = {
       ],
       profileDuration: [
         {
-          events: 50,
+          events: 0,
+          unitPrice: 60.0,
+          price: 0,
+          onDemandPrice: 78.0,
+        },
+      ],
+      profileDurationUI: [
+        {
+          events: 0,
           unitPrice: 60.0,
           price: 0,
           onDemandPrice: 78.0,
@@ -829,6 +841,7 @@ const AM3_PLANS: Record<string, Plan> = {
     availableCategories: AM3_CATEGORIES,
     onDemandCategories: AM3_CATEGORIES,
     hasOnDemandModes: false,
+    budgetTerm: BUDGET_TERM,
     planCategories: {
       errors: [
         {
@@ -1196,7 +1209,15 @@ const AM3_PLANS: Record<string, Plan> = {
       ],
       profileDuration: [
         {
-          events: 50,
+          events: 0,
+          unitPrice: 60.0,
+          price: 0,
+          onDemandPrice: 78.0,
+        },
+      ],
+      profileDurationUI: [
+        {
+          events: 0,
           unitPrice: 60.0,
           price: 0,
           onDemandPrice: 78.0,
@@ -1316,6 +1337,7 @@ const AM3_PLANS: Record<string, Plan> = {
     availableCategories: AM3_CATEGORIES,
     onDemandCategories: AM3_CATEGORIES,
     hasOnDemandModes: false,
+    budgetTerm: BUDGET_TERM,
     planCategories: {
       errors: [
         {
@@ -1359,7 +1381,15 @@ const AM3_PLANS: Record<string, Plan> = {
       ],
       profileDuration: [
         {
-          events: 100,
+          events: 0,
+          unitPrice: 0,
+          price: 0,
+          onDemandPrice: 0,
+        },
+      ],
+      profileDurationUI: [
+        {
+          events: 0,
           unitPrice: 0,
           price: 0,
           onDemandPrice: 0,
@@ -1401,6 +1431,7 @@ const AM3_PLANS: Record<string, Plan> = {
     availableCategories: AM3_CATEGORIES,
     onDemandCategories: AM3_CATEGORIES,
     hasOnDemandModes: false,
+    budgetTerm: BUDGET_TERM,
     planCategories: {
       errors: [
         {
@@ -1444,7 +1475,15 @@ const AM3_PLANS: Record<string, Plan> = {
       ],
       profileDuration: [
         {
-          events: 100,
+          events: 0,
+          unitPrice: 0,
+          price: 0,
+          onDemandPrice: 0,
+        },
+      ],
+      profileDurationUI: [
+        {
+          events: 0,
           unitPrice: 0,
           price: 0,
           onDemandPrice: 0,
@@ -1486,6 +1525,7 @@ const AM3_PLANS: Record<string, Plan> = {
     availableCategories: AM3_DS_CATEGORIES,
     onDemandCategories: AM3_DS_CATEGORIES,
     hasOnDemandModes: false,
+    budgetTerm: BUDGET_TERM,
     planCategories: {
       errors: [
         {
@@ -1537,7 +1577,15 @@ const AM3_PLANS: Record<string, Plan> = {
       ],
       profileDuration: [
         {
-          events: 100,
+          events: 0,
+          unitPrice: 0,
+          price: 0,
+          onDemandPrice: 0,
+        },
+      ],
+      profileDurationUI: [
+        {
+          events: 0,
           unitPrice: 0,
           price: 0,
           onDemandPrice: 0,
@@ -1579,6 +1627,7 @@ const AM3_PLANS: Record<string, Plan> = {
     availableCategories: AM3_DS_CATEGORIES,
     onDemandCategories: AM3_DS_CATEGORIES,
     hasOnDemandModes: false,
+    budgetTerm: BUDGET_TERM,
     planCategories: {
       errors: [
         {
@@ -1630,7 +1679,15 @@ const AM3_PLANS: Record<string, Plan> = {
       ],
       profileDuration: [
         {
-          events: 100,
+          events: 0,
+          unitPrice: 0,
+          price: 0,
+          onDemandPrice: 0,
+        },
+      ],
+      profileDurationUI: [
+        {
+          events: 0,
           unitPrice: 0,
           price: 0,
           onDemandPrice: 0,
@@ -1672,6 +1729,7 @@ const AM3_PLANS: Record<string, Plan> = {
     availableCategories: AM3_CATEGORIES,
     onDemandCategories: AM3_CATEGORIES,
     hasOnDemandModes: false,
+    budgetTerm: BUDGET_TERM,
     planCategories: {
       errors: [
         {
@@ -1715,7 +1773,15 @@ const AM3_PLANS: Record<string, Plan> = {
       ],
       profileDuration: [
         {
-          events: 50,
+          events: 0,
+          unitPrice: 0,
+          price: 0,
+          onDemandPrice: 0,
+        },
+      ],
+      profileDurationUI: [
+        {
+          events: 0,
           unitPrice: 0,
           price: 0,
           onDemandPrice: 0,
@@ -1757,6 +1823,7 @@ const AM3_PLANS: Record<string, Plan> = {
     availableCategories: AM3_CATEGORIES,
     onDemandCategories: AM3_CATEGORIES,
     hasOnDemandModes: false,
+    budgetTerm: BUDGET_TERM,
     planCategories: {
       errors: [
         {
@@ -1799,6 +1866,14 @@ const AM3_PLANS: Record<string, Plan> = {
         },
       ],
       profileDuration: [
+        {
+          events: 0,
+          unitPrice: 0,
+          price: 0,
+          onDemandPrice: 0,
+        },
+      ],
+      profileDurationUI: [
         {
           events: 0,
           unitPrice: 0,
@@ -1842,6 +1917,7 @@ const AM3_PLANS: Record<string, Plan> = {
     availableCategories: AM3_DS_CATEGORIES,
     onDemandCategories: AM3_DS_CATEGORIES,
     hasOnDemandModes: false,
+    budgetTerm: BUDGET_TERM,
     planCategories: {
       errors: [
         {
@@ -1884,6 +1960,14 @@ const AM3_PLANS: Record<string, Plan> = {
         },
       ],
       profileDuration: [
+        {
+          events: 0,
+          unitPrice: 0,
+          price: 0,
+          onDemandPrice: 0,
+        },
+      ],
+      profileDurationUI: [
         {
           events: 0,
           unitPrice: 0,
@@ -1935,6 +2019,7 @@ const AM3_PLANS: Record<string, Plan> = {
     availableCategories: AM3_CATEGORIES,
     onDemandCategories: AM3_CATEGORIES,
     hasOnDemandModes: false,
+    budgetTerm: BUDGET_TERM,
     planCategories: {
       errors: [
         {
@@ -2307,8 +2392,10 @@ const AM3_PLANS: Record<string, Plan> = {
           price: 0,
           onDemandPrice: 78.0,
         },
+      ],
+      profileDurationUI: [
         {
-          events: 50,
+          events: 0,
           unitPrice: 60.0,
           price: 0,
           onDemandPrice: 78.0,
@@ -2428,6 +2515,7 @@ const AM3_PLANS: Record<string, Plan> = {
     availableCategories: AM3_CATEGORIES,
     onDemandCategories: AM3_CATEGORIES,
     hasOnDemandModes: false,
+    budgetTerm: BUDGET_TERM,
     planCategories: {
       errors: [
         {
@@ -2795,7 +2883,15 @@ const AM3_PLANS: Record<string, Plan> = {
       ],
       profileDuration: [
         {
-          events: 50,
+          events: 0,
+          unitPrice: 60.0,
+          price: 0,
+          onDemandPrice: 78.0,
+        },
+      ],
+      profileDurationUI: [
+        {
+          events: 0,
           unitPrice: 60.0,
           price: 0,
           onDemandPrice: 78.0,
@@ -2915,6 +3011,7 @@ const AM3_PLANS: Record<string, Plan> = {
     availableCategories: AM3_CATEGORIES,
     onDemandCategories: AM3_CATEGORIES,
     hasOnDemandModes: false,
+    budgetTerm: BUDGET_TERM,
     planCategories: {
       errors: [
         {

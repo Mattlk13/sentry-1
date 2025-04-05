@@ -2,6 +2,7 @@ import {useCallback, useRef} from 'react';
 import {useNavigate} from 'react-router-dom';
 import {useTheme} from '@emotion/react';
 import styled from '@emotion/styled';
+import {mergeRefs} from '@react-aria/utils';
 import * as Sentry from '@sentry/react';
 import type {SeriesOption, YAXisComponentOption} from 'echarts';
 import type {
@@ -11,6 +12,7 @@ import type {
 import type EChartsReactCore from 'echarts-for-react/lib/core';
 import groupBy from 'lodash/groupBy';
 import mapValues from 'lodash/mapValues';
+import sum from 'lodash/sum';
 
 import BaseChart from 'sentry/components/charts/baseChart';
 import {getFormatter} from 'sentry/components/charts/components/tooltip';
@@ -18,8 +20,11 @@ import TransparentLoadingMask from 'sentry/components/charts/transparentLoadingM
 import {useChartZoom} from 'sentry/components/charts/useChartZoom';
 import {isChartHovered, truncationFormatter} from 'sentry/components/charts/utils';
 import LoadingIndicator from 'sentry/components/loadingIndicator';
-import {getChartColorPalette} from 'sentry/constants/chartPalette';
-import type {EChartDataZoomHandler, ReactEchartsRef} from 'sentry/types/echarts';
+import type {
+  EChartDataZoomHandler,
+  EChartHighlightHandler,
+  ReactEchartsRef,
+} from 'sentry/types/echarts';
 import {defined} from 'sentry/utils';
 import {uniq} from 'sentry/utils/array/uniq';
 import type {AggregationOutputType} from 'sentry/utils/discover/fields';
@@ -41,7 +46,7 @@ import {ReleaseSeries} from './releaseSeries';
 import {FALLBACK_TYPE, FALLBACK_UNIT_FOR_FIELD_TYPE} from './settings';
 import {TimeSeriesWidgetYAxis} from './timeSeriesWidgetYAxis';
 
-const {error, warn, info} = Sentry._experiment_log;
+const {error, warn, info} = Sentry.logger;
 
 export interface TimeSeriesWidgetVisualizationProps {
   /**
@@ -66,10 +71,24 @@ export interface TimeSeriesWidgetVisualizationProps {
    * Callback that returns an updated ECharts zoom selection. If omitted, the default behavior is to update the URL with updated `start` and `end` query parameters.
    */
   onZoom?: EChartDataZoomHandler;
+
+  ref?: React.Ref<ReactEchartsRef>;
+
   /**
    * Array of `Release` objects. If provided, they are plotted on line and area visualizations as vertical lines
    */
   releases?: Release[];
+
+  /**
+   * Defines the legend's visibility.
+   *
+   * - `auto`: Show the legend if there are multiple series.
+   * - `never`: Never show the legend.
+   *
+   * Default: `auto`
+   */
+  showLegend?: 'auto' | 'never';
+
   /**
    * Show releases as either lines per release or a bubble for a group of releases.
    */
@@ -112,16 +131,20 @@ export function TimeSeriesWidgetVisualization(props: TimeSeriesWidgetVisualizati
     releaseBubbleXAxis,
     releaseBubbleGrid,
   } = useReleaseBubbles({
-    chartRenderer: ({start: trimStart, end: trimEnd}) => {
+    chartRenderer: ({start: trimStart, end: trimEnd, ref: chartRendererRef}) => {
       return (
-        <TimeSeriesWidgetVisualization
-          {...props}
-          disableReleaseNavigation
-          plottables={props.plottables.map(plottable =>
-            plottable.constrain(trimStart, trimEnd)
-          )}
-          showReleaseAs="line"
-        />
+        <DrawerWidgetWrapper>
+          <TimeSeriesWidgetVisualization
+            {...props}
+            ref={chartRendererRef}
+            disableReleaseNavigation
+            onZoom={() => {}}
+            plottables={props.plottables.map(plottable =>
+              plottable.constrain(trimStart, trimEnd)
+            )}
+            showReleaseAs="line"
+          />
+        </DrawerWidgetWrapper>
       );
     },
     minTime: earliestTimeStamp ? new Date(earliestTimeStamp).getTime() : undefined,
@@ -155,11 +178,13 @@ export function TimeSeriesWidgetVisualization(props: TimeSeriesWidgetVisualizati
   const hasReleaseBubblesSeries = hasReleaseBubbles && releaseSeries;
 
   const handleChartRef = useCallback(
-    (e: ReactEchartsRef) => {
-      chartRef.current = e;
-
+    (e: ReactEchartsRef | null) => {
       if (!e?.getEchartsInstance) {
         return;
+      }
+
+      for (const plottable of props.plottables) {
+        plottable.handleChartRef?.(e);
       }
 
       const echartsInstance = e.getEchartsInstance();
@@ -169,10 +194,15 @@ export function TimeSeriesWidgetVisualization(props: TimeSeriesWidgetVisualizati
         connectReleaseBubbleChartRef(e);
       }
     },
-    [hasReleaseBubblesSeries, connectReleaseBubbleChartRef, registerWithWidgetSyncContext]
+    [
+      hasReleaseBubblesSeries,
+      connectReleaseBubbleChartRef,
+      registerWithWidgetSyncContext,
+      props.plottables,
+    ]
   );
 
-  const chartZoomProps = useChartZoom({
+  const {onDataZoom, ...chartZoomProps} = useChartZoom({
     saveOnZoom: true,
   });
 
@@ -295,8 +325,15 @@ export function TimeSeriesWidgetVisualization(props: TimeSeriesWidgetVisualizati
 
   const palette =
     paletteSize > 0
-      ? getChartColorPalette(paletteSize - 2)! // -2 because getColorPalette artificially adds 1, I'm not sure why
+      ? theme.chart.getColorPalette(paletteSize - 2) // -2 because getColorPalette artificially adds 1, I'm not sure why
       : [];
+
+  // Create a lookup of series names (given to ECharts) to labels (from
+  // Plottable). This makes it easier to look up alises when rendering tooltips
+  // and legends
+  const aliases = Object.fromEntries(
+    props.plottables.map(plottable => [plottable.name, plottable.label])
+  );
 
   // Create tooltip formatter
   const formatTooltip: TooltipFormatterCallback<TopLevelFormatterParams> = (
@@ -339,6 +376,22 @@ export function TimeSeriesWidgetVisualization(props: TimeSeriesWidgetVisualizati
     return getFormatter({
       isGroupedByDate: true,
       showTimeInTooltip: true,
+      nameFormatter: function (seriesName, nameFormatterParams) {
+        if (!nameFormatterParams) {
+          return seriesName;
+        }
+
+        if (
+          nameFormatterParams.seriesType === 'scatter' &&
+          Array.isArray(nameFormatterParams.data)
+        ) {
+          // For scatter series, the third point in the `data` array should be the sample's ID
+          const sampleId = nameFormatterParams.data.at(2);
+          return defined(sampleId) ? sampleId.toString() : seriesName;
+        }
+
+        return aliases[seriesName] ?? seriesName;
+      },
       valueFormatter: function (value, _field, valueFormatterParams) {
         // Use the series to figure out the corresponding `Plottable`, and get the field type. From that, use whichever unit we chose for that field type.
 
@@ -376,7 +429,8 @@ export function TimeSeriesWidgetVisualization(props: TimeSeriesWidgetVisualizati
     visibleSeriesCount += 1;
   }
 
-  const showLegend = visibleSeriesCount > 1;
+  const showLegendProp = props.showLegend ?? 'auto';
+  const showLegend = showLegendProp !== 'never' && visibleSeriesCount > 1;
 
   // Keep track of which `Series[]` indexes correspond to which `Plottable` so
   // we can look up the types in the tooltip. We need this so we can find the
@@ -389,7 +443,7 @@ export function TimeSeriesWidgetVisualization(props: TimeSeriesWidgetVisualizati
 
   // Keep track of what color in the chosen palette we're assigning
   let seriesColorIndex = 0;
-  const series: SeriesOption[] = props.plottables.flatMap(plottable => {
+  const seriesFromPlottables: SeriesOption[] = props.plottables.flatMap(plottable => {
     let color: string | undefined;
 
     if (plottable.needsColor) {
@@ -429,6 +483,7 @@ export function TimeSeriesWidgetVisualization(props: TimeSeriesWidgetVisualizati
       color,
       yAxisPosition,
       unit: unitForType[plottable.dataType ?? FALLBACK_TYPE],
+      theme,
     });
 
     seriesIndexToPlottableMapRanges.push({
@@ -445,12 +500,46 @@ export function TimeSeriesWidgetVisualization(props: TimeSeriesWidgetVisualizati
     seriesIndexToPlottableMapRanges
   );
 
+  const allSeries = [...seriesFromPlottables, releaseSeries].filter(defined);
+
+  const handleHighlight: EChartHighlightHandler = event => {
+    for (const batch of event.batch ?? []) {
+      const affectedRange = seriesIndexToPlottableRangeMap.getRange(batch.seriesIndex);
+      const affectedPlottable = affectedRange?.value;
+
+      if (
+        !defined(affectedRange) ||
+        !defined(affectedPlottable) ||
+        !defined(affectedPlottable.onHighlight)
+      ) {
+        continue;
+      }
+
+      // Each plottable creates anywhere from 1 to N `Series` objects.
+      // `batch.dataIndex` is the data index in the _series_, not in the
+      // plottable. e.g., If this is the third series of the plottable, the data
+      // index in the plottable needs to be offset by the data counts of the
+      // first two.
+      const dataIndexOffset: number = sum(
+        allSeries
+          .slice(affectedRange.min ?? 0, batch.seriesIndex)
+          .map(seriesOfPlottable => {
+            return Array.isArray(seriesOfPlottable.data)
+              ? seriesOfPlottable.data.length
+              : 0;
+          })
+      );
+
+      affectedPlottable.onHighlight(dataIndexOffset + batch.dataIndex);
+    }
+  };
+
   return (
     <BaseChart
-      ref={handleChartRef}
+      ref={mergeRefs(props.ref, chartRef, handleChartRef)}
       {...releaseBubbleEventHandlers}
       autoHeightResize
-      series={[...series, releaseSeries].filter(defined)}
+      series={allSeries}
       grid={{
         // NOTE: Adding a few pixels of left padding prevents ECharts from
         // incorrectly truncating long labels. See
@@ -469,7 +558,7 @@ export function TimeSeriesWidgetVisualization(props: TimeSeriesWidgetVisualizati
               left: 0,
               formatter(seriesName: string) {
                 return truncationFormatter(
-                  seriesName,
+                  aliases[seriesName] ?? seriesName,
                   true,
                   // Escaping the legend string will cause some special
                   // characters to render as their HTML equivalents.
@@ -510,13 +599,14 @@ export function TimeSeriesWidgetVisualization(props: TimeSeriesWidgetVisualizati
       }}
       yAxes={yAxes}
       {...chartZoomProps}
-      {...(props.onZoom ? {onDataZoom: props.onZoom} : {})}
+      onDataZoom={props.onZoom ?? onDataZoom}
       isGroupedByDate
       useMultilineDate
       start={start ? new Date(start) : undefined}
       end={end ? new Date(end) : undefined}
       period={period}
       utc={utc ?? undefined}
+      onHighlight={handleHighlight}
     />
   );
 }
@@ -543,6 +633,10 @@ const LoadingPlaceholder = styled('div')`
 
 const LoadingMask = styled(TransparentLoadingMask)`
   background: ${p => p.theme.background};
+`;
+
+const DrawerWidgetWrapper = styled('div')`
+  height: 220px;
 `;
 
 TimeSeriesWidgetVisualization.LoadingPlaceholder = LoadingPanel;

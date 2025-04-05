@@ -1,4 +1,5 @@
 import {Fragment} from 'react';
+import {useTheme} from '@emotion/react';
 import styled from '@emotion/styled';
 
 import {useFetchEventAttachments} from 'sentry/actionCreators/events';
@@ -34,6 +35,7 @@ interface HighlightsIconSummaryProps {
 }
 
 export function HighlightsIconSummary({event, group}: HighlightsIconSummaryProps) {
+  const theme = useTheme();
   const organization = useOrganization();
 
   // Project slug and project id are pull out because group is not always available
@@ -50,7 +52,13 @@ export function HighlightsIconSummary({event, group}: HighlightsIconSummaryProps
   // Hide device for non-native platforms since it's mostly duplicate of the client_os or os context
   const shouldDisplayDevice =
     isMobilePlatform(projectPlatform) || isNativePlatform(projectPlatform);
-  // For now, highlight icons are only interpretted from context. We should extend this to tags
+
+  // Errors thrown on the backend of a Meta-Framework (e.g. Next.js) also include the client context
+  const isMetaFrameworkBackendIssue =
+    Object.keys(event.contexts).includes('client_os') &&
+    Object.keys(event.contexts).includes('os');
+
+  // For now, highlight icons are only interpreted from context. We should extend this to tags
   // eventually, but for now, it'll match the previous expectations.
   const items = getOrderedContextItems(event)
     .map(item => ({
@@ -65,11 +73,15 @@ export function HighlightsIconSummary({event, group}: HighlightsIconSummaryProps
         contextIconProps: {
           size: 'md',
         },
+        theme,
       }),
     }))
     .filter((item, _index, array) => {
-      // Prefer the "os" context for OS information
-      if (item.contextType === 'client_os' && array.find(i => i.contextType === 'os')) {
+      if (
+        // Hide client information in backend issues (always prefer `os` over `client_os`)
+        isMetaFrameworkBackendIssue &&
+        (item.contextType === 'browser' || item.alias === 'client_os')
+      ) {
         return false;
       }
 

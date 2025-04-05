@@ -120,7 +120,7 @@ def _generate_fixability_score(group_id: int):
     )
 
     response = requests.post(
-        f"{settings.SEER_AUTOFIX_URL}{path}",
+        f"{settings.SEER_SEVERITY_URL}{path}",
         data=body,
         headers={
             "content-type": "application/json;charset=utf-8",
@@ -134,8 +134,13 @@ def _generate_fixability_score(group_id: int):
 
 
 def _get_trace_connected_issues(event: GroupEvent) -> list[Group]:
-    trace_id = event.trace_id
-    if not trace_id:
+    try:
+        trace_id = event.trace_id
+        if not trace_id:
+            return []
+    except (
+        AttributeError
+    ):  # sometimes the trace doesn't exist and this errors, so we just ignore it
         return []
     organization = event.group.organization
     conditions = [["trace", "=", trace_id]]
@@ -155,6 +160,7 @@ def _get_trace_connected_issues(event: GroupEvent) -> list[Group]:
         filter=event_filter,
         referrer="api.group_ai_summary",
         tenant_ids={"organization_id": organization.id},
+        limit=5,
     )
     connected_events = sorted(
         connected_events, key=lambda event: event.datetime
@@ -179,6 +185,7 @@ def get_issue_summary(
     group: Group,
     user: User | RpcUser | AnonymousUser | None = None,
     force_event_id: str | None = None,
+    source: str = "issue_details",
 ) -> tuple[dict[str, Any], int]:
     """
     Generate an AI summary for an issue.
@@ -242,11 +249,16 @@ def get_issue_summary(
                 not autofix_state
             ):  # Only trigger autofix if we don't have an autofix on this issue already.
                 with sentry_sdk.start_span(op="ai_summary.trigger_autofix"):
+                    auto_run_source_map = {
+                        "issue_details": "issue_summary_fixability",
+                        "alert": "issue_summary_on_alert_fixability",
+                    }
+
                     response = trigger_autofix(
                         group=group,
                         event_id=event.event_id,
                         user=user,
-                        auto_run_source="issue_summary_fixability",
+                        auto_run_source=auto_run_source_map.get(source, "unknown_source"),
                     )
 
                     if response.status_code != 202:

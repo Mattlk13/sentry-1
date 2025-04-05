@@ -176,6 +176,7 @@ class OrganizationEventsTimeseriesEndpoint(OrganizationEventsV2EndpointBase):
 
         self.validate_comparison_delta(comparison_delta, snuba_params, organization)
         rollup = self.get_rollup(request, snuba_params, top_events, use_rpc)
+        snuba_params.granularity_secs = rollup
         axes = request.GET.getlist("yAxis", ["count()"])
 
         with handle_query_errors():
@@ -210,6 +211,7 @@ class OrganizationEventsTimeseriesEndpoint(OrganizationEventsV2EndpointBase):
         allow_metric_aggregates = request.GET.get("preventMetricAggregates") != "1"
         include_other = request.GET.get("excludeOther") != "1"
         referrer = request.GET.get("referrer")
+        sampling_mode = request.GET.get("sampling")
         referrer = (
             referrer
             if referrer in ALLOWED_EVENTS_STATS_REFERRERS.union(METRICS_ENHANCED_REFERRERS)
@@ -241,11 +243,11 @@ class OrganizationEventsTimeseriesEndpoint(OrganizationEventsV2EndpointBase):
                     orderby=self.get_orderby(request),
                     limit=top_events,
                     referrer=referrer,
-                    granularity_secs=rollup,
                     config=SearchResolverConfig(
                         auto_fields=False,
                         use_aggregate_conditions=True,
                     ),
+                    sampling_mode=sampling_mode,
                 )
             return dataset.top_events_timeseries(
                 timeseries_columns=query_columns,
@@ -275,12 +277,12 @@ class OrganizationEventsTimeseriesEndpoint(OrganizationEventsV2EndpointBase):
                 params=snuba_params,
                 query_string=query,
                 y_axes=query_columns,
-                granularity_secs=rollup,
                 referrer=referrer,
                 config=SearchResolverConfig(
                     auto_fields=False,
                     use_aggregate_conditions=True,
                 ),
+                sampling_mode=sampling_mode,
                 comparison_delta=comparison_delta,
             )
 

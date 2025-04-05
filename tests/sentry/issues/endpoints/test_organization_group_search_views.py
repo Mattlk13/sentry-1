@@ -5,8 +5,7 @@ from django.utils import timezone
 from rest_framework.exceptions import ErrorDetail
 
 from sentry.api.serializers.rest_framework.groupsearchview import GroupSearchViewValidatorResponse
-from sentry.issues.endpoints.organization_group_search_views import DEFAULT_VIEWS
-from sentry.models.groupsearchview import GroupSearchView, GroupSearchViewVisibility
+from sentry.models.groupsearchview import DEFAULT_VIEWS, GroupSearchView, GroupSearchViewVisibility
 from sentry.models.groupsearchviewlastvisited import GroupSearchViewLastVisited
 from sentry.models.groupsearchviewstarred import GroupSearchViewStarred
 from sentry.testutils.cases import APITestCase, TransactionTestCase
@@ -22,7 +21,6 @@ def are_views_equal(
         view_1["name"] == view_2["name"]
         and view_1["query"] == view_2["query"]
         and view_1["querySort"] == view_2["querySort"]
-        and view_1["position"] == view_2["position"]
         and view_1["environments"] == view_2["environments"]
         and view_1["timeFilters"] == view_2["timeFilters"]
         and view_1["projects"] == view_2["projects"]
@@ -132,11 +130,8 @@ class OrganizationGroupSearchViewsGetTest(BaseGSVTestCase):
         response = self.get_success_response(self.organization.slug)
 
         assert response.data[0]["id"] == str(objs["user_one_views"][0].id)
-        assert response.data[0]["position"] == 0
         assert response.data[1]["id"] == str(objs["user_one_views"][1].id)
-        assert response.data[1]["position"] == 1
         assert response.data[2]["id"] == str(objs["user_one_views"][2].id)
-        assert response.data[2]["position"] == 2
 
     @with_feature({"organizations:issue-stream-custom-views": True})
     @with_feature({"organizations:global-views": True})
@@ -170,9 +165,7 @@ class OrganizationGroupSearchViewsGetTest(BaseGSVTestCase):
         response = self.get_success_response(self.organization.slug)
 
         assert response.data[0]["id"] == str(objs["user_two_views"][0].id)
-        assert response.data[0]["position"] == 0
         assert response.data[1]["id"] == str(objs["user_two_views"][1].id)
-        assert response.data[1]["position"] == 1
 
     @with_feature({"organizations:issue-stream-custom-views": True})
     @with_feature({"organizations:global-views": True})
@@ -188,7 +181,6 @@ class OrganizationGroupSearchViewsGetTest(BaseGSVTestCase):
         assert view["name"] == "Prioritized"
         assert view["query"] == "is:unresolved issue.priority:[high, medium]"
         assert view["querySort"] == "date"
-        assert view["position"] == 0
 
     @with_feature({"organizations:issue-stream-custom-views": True})
     @with_feature({"organizations:global-views": True})
@@ -201,6 +193,269 @@ class OrganizationGroupSearchViewsGetTest(BaseGSVTestCase):
         assert response.data[0]["timeFilters"] == {"period": "14d"}
         assert response.data[0]["projects"] == []
         assert response.data[0]["environments"] == []
+
+
+class OrganizationGroupSearchViewsPostTest(APITestCase):
+    endpoint = "sentry-api-0-organization-group-search-views"
+    method = "post"
+
+    def setUp(self) -> None:
+        self.login_as(user=self.user)
+        self.project1 = self.create_project(organization=self.organization, slug="project-a")
+        self.project2 = self.create_project(organization=self.organization, slug="project-b")
+        self.url = reverse(
+            "sentry-api-0-organization-group-search-views",
+            kwargs={"organization_id_or_slug": self.organization.slug},
+        )
+
+    @with_feature({"organizations:issue-stream-custom-views": True})
+    @with_feature({"organizations:global-views": True})
+    def test_create_basic_view(self) -> None:
+        data = {
+            "name": "Custom View One",
+            "query": "is:unresolved",
+            "querySort": "date",
+            "projects": [],
+            "environments": [],
+            "timeFilters": {"period": "14d"},
+        }
+
+        response = self.get_success_response(self.organization.slug, **data, status_code=201)
+
+        assert response.data["name"] == "Custom View One"
+        assert response.data["query"] == "is:unresolved"
+        assert response.data["querySort"] == "date"
+        assert response.data["projects"] == []
+        assert response.data["environments"] == []
+        assert response.data["timeFilters"] == {"period": "14d"}
+
+        view = GroupSearchView.objects.get(id=response.data["id"])
+        assert view.name == "Custom View One"
+        assert view.query == "is:unresolved"
+        assert view.query_sort == "date"
+
+        assert not GroupSearchViewStarred.objects.filter(
+            organization=self.organization,
+            user_id=self.user.id,
+            group_search_view=view,
+        ).exists()
+
+    @with_feature({"organizations:issue-stream-custom-views": True})
+    @with_feature({"organizations:global-views": True})
+    def test_create_view_with_projects(self) -> None:
+        """Test creating a view with specific projects"""
+        data = {
+            "name": "Project View",
+            "query": "is:unresolved",
+            "querySort": "date",
+            "projects": [self.project1.id, self.project2.id],
+            "environments": [],
+            "timeFilters": {"period": "14d"},
+        }
+
+        response = self.get_success_response(self.organization.slug, **data, status_code=201)
+
+        assert set(response.data["projects"]) == {self.project1.id, self.project2.id}
+
+        # Verify the projects association in the database
+        view = GroupSearchView.objects.get(id=response.data["id"])
+        assert set(view.projects.values_list("id", flat=True)) == {
+            self.project1.id,
+            self.project2.id,
+        }
+
+    @with_feature({"organizations:issue-stream-custom-views": True})
+    @with_feature({"organizations:global-views": True})
+    def test_create_view_all_projects(self) -> None:
+        """Test creating a view for all projects"""
+        data = {
+            "name": "All Projects View",
+            "query": "is:unresolved",
+            "querySort": "date",
+            "projects": [-1],
+            "environments": [],
+            "timeFilters": {"period": "14d"},
+        }
+
+        response = self.get_success_response(self.organization.slug, **data, status_code=201)
+
+        assert response.data["projects"] == [-1]
+
+        # Verify in the database
+        view = GroupSearchView.objects.get(id=response.data["id"])
+        assert view.is_all_projects is True
+        assert list(view.projects.all()) == []  # No projects should be associated
+
+    @with_feature({"organizations:issue-stream-custom-views": True})
+    @with_feature({"organizations:global-views": True})
+    def test_create_view_with_environments(self) -> None:
+        """Test creating a view with specific environments"""
+        data = {
+            "name": "Environment View",
+            "query": "is:unresolved",
+            "querySort": "date",
+            "projects": [],
+            "environments": ["production", "staging"],
+            "timeFilters": {"period": "14d"},
+        }
+
+        response = self.get_success_response(self.organization.slug, **data, status_code=201)
+
+        assert set(response.data["environments"]) == {"production", "staging"}
+
+        # Verify in the database
+        view = GroupSearchView.objects.get(id=response.data["id"])
+        assert set(view.environments) == {"production", "staging"}
+
+    @with_feature({"organizations:issue-stream-custom-views": True})
+    @with_feature({"organizations:global-views": True})
+    def test_create_view_with_time_filters(self) -> None:
+        """Test creating a view with custom time filters"""
+        data = {
+            "name": "Time Filtered View",
+            "query": "is:unresolved",
+            "querySort": "date",
+            "projects": [],
+            "environments": [],
+            "timeFilters": {"period": "90d"},
+        }
+
+        response = self.get_success_response(self.organization.slug, **data, status_code=201)
+
+        assert response.data["timeFilters"] == {"period": "90d"}
+
+        # Verify in the database
+        view = GroupSearchView.objects.get(id=response.data["id"])
+        assert view.time_filters == {"period": "90d"}
+
+    @with_feature({"organizations:issue-stream-custom-views": True})
+    @with_feature({"organizations:global-views": True})
+    def test_create_view_with_starred(self) -> None:
+        data = {
+            "name": "Starred View",
+            "query": "is:unresolved",
+            "querySort": "date",
+            "projects": [],
+            "environments": [],
+            "timeFilters": {"period": "14d"},
+            "starred": True,
+        }
+
+        response = self.get_success_response(self.organization.slug, **data, status_code=201)
+
+        view_id = response.data["id"]
+        assert GroupSearchViewStarred.objects.filter(
+            organization=self.organization,
+            user_id=self.user.id,
+            group_search_view_id=view_id,
+        ).exists()
+
+    @with_feature({"organizations:issue-stream-custom-views": True})
+    @with_feature({"organizations:global-views": False})
+    def test_create_view_without_global_views(self) -> None:
+        data = {
+            "name": "No Global View",
+            "query": "is:unresolved",
+            "querySort": "date",
+            "projects": [self.project1.id],
+            "environments": [],
+            "timeFilters": {"period": "14d"},
+        }
+
+        response = self.get_success_response(self.organization.slug, **data, status_code=201)
+
+        assert response.data["projects"] == [self.project1.id]
+
+    @with_feature({"organizations:issue-stream-custom-views": True})
+    @with_feature({"organizations:global-views": False})
+    def test_invalid_multiple_projects_without_global_views(self) -> None:
+        data = {
+            "name": "Multiple Projects View",
+            "query": "is:unresolved",
+            "querySort": "date",
+            "projects": [self.project1.id, self.project2.id],
+            "environments": [],
+            "timeFilters": {"period": "14d"},
+        }
+
+        response = self.get_error_response(self.organization.slug, **data)
+
+        assert "You do not have the multi project stream feature enabled" in str(response.data)
+
+    @with_feature({"organizations:issue-stream-custom-views": True})
+    @with_feature({"organizations:global-views": False})
+    def test_invalid_all_projects_without_global_views(self) -> None:
+        data = {
+            "name": "All Projects View",
+            "query": "is:unresolved",
+            "querySort": "date",
+            "projects": [-1],
+            "environments": [],
+            "timeFilters": {"period": "14d"},
+        }
+
+        response = self.get_error_response(self.organization.slug, **data)
+
+        assert "You do not have the multi project stream feature enabled" in str(response.data)
+
+    @with_feature({"organizations:issue-stream-custom-views": False})
+    def test_feature_flag_disabled(self) -> None:
+        data = {
+            "name": "Custom View",
+            "query": "is:unresolved",
+            "querySort": "date",
+            "projects": [],
+            "environments": [],
+            "timeFilters": {"period": "14d"},
+        }
+
+        response = self.get_response(self.organization.slug, **data)
+        assert response.status_code == 404
+
+    @with_feature({"organizations:issue-stream-custom-views": True})
+    @with_feature({"organizations:global-views": True})
+    def test_invalid_sort_option(self) -> None:
+        data = {
+            "name": "Invalid Sort View",
+            "query": "is:unresolved",
+            "querySort": "invalid_sort",
+            "projects": [],
+            "environments": [],
+            "timeFilters": {"period": "14d"},
+        }
+
+        response = self.get_error_response(self.organization.slug, **data)
+        assert "querySort" in response.data
+
+    @with_feature({"organizations:issue-stream-custom-views": True})
+    @with_feature({"organizations:global-views": True})
+    def test_invalid_time_filters(self) -> None:
+        data = {
+            "name": "Invalid Time Filters View",
+            "query": "is:unresolved",
+            "querySort": "date",
+            "projects": [],
+            "environments": [],
+            "timeFilters": {},  # Empty time filters
+        }
+
+        response = self.get_error_response(self.organization.slug, **data)
+        assert "timeFilters" in response.data
+
+    @with_feature({"organizations:issue-stream-custom-views": True})
+    @with_feature({"organizations:global-views": True})
+    def test_nonexistent_project(self) -> None:
+        data = {
+            "name": "Nonexistent Project View",
+            "query": "is:unresolved",
+            "querySort": "date",
+            "projects": [999999],  # This project ID should not exist
+            "environments": [],
+            "timeFilters": {"period": "14d"},
+        }
+
+        response = self.get_error_response(self.organization.slug, **data)
+        assert "projects" in response.data
 
 
 class OrganizationGroupSearchViewsPutTest(BaseGSVTestCase):
@@ -243,7 +498,6 @@ class OrganizationGroupSearchViewsPutTest(BaseGSVTestCase):
         assert len(starred_views) == len(response.data)
         for idx, view in enumerate(response.data):
             assert starred_views[idx].position == idx
-            assert starred_views[idx].position == view["position"]
             assert str(starred_views[idx].group_search_view.id) == view["id"]
 
         # Verify that the deleted view is no longer in the starred table
@@ -281,7 +535,6 @@ class OrganizationGroupSearchViewsPutTest(BaseGSVTestCase):
         assert len(starred_views) == len(response.data)
         for idx, view in enumerate(response.data):
             assert starred_views[idx].position == idx
-            assert starred_views[idx].position == view["position"]
             assert str(starred_views[idx].group_search_view.id) == view["id"]
 
     @with_feature({"organizations:issue-stream-custom-views": True})
@@ -305,14 +558,8 @@ class OrganizationGroupSearchViewsPutTest(BaseGSVTestCase):
     @with_feature({"organizations:global-views": True})
     def test_reorder_views(self) -> None:
         views = self.client.get(self.url).data
-        view_one = views[0]
-        view_two = views[1]
-        views[0] = view_two
-        views[1] = view_one
-
-        # We should expect the position of these two views to be swapped in the response
-        view_one["position"] = 1
-        view_two["position"] = 0
+        view_one, view_two = views[0], views[1]
+        views[0], views[1] = view_two, view_one
 
         response = self.get_success_response(self.organization.slug, views=views)
 
@@ -327,7 +574,6 @@ class OrganizationGroupSearchViewsPutTest(BaseGSVTestCase):
         assert len(starred_views) == len(response.data)
         for idx, view in enumerate(response.data):
             assert starred_views[idx].position == idx
-            assert starred_views[idx].position == view["position"]
             assert str(starred_views[idx].group_search_view.id) == view["id"]
 
     @with_feature({"organizations:issue-stream-custom-views": True})
@@ -386,7 +632,6 @@ class OrganizationGroupSearchViewsPutTest(BaseGSVTestCase):
         assert len(starred_views) == len(response.data)
         for idx, view in enumerate(response.data):
             assert starred_views[idx].position == idx
-            assert starred_views[idx].position == view["position"]
             assert str(starred_views[idx].group_search_view.id) == view["id"]
 
     @with_feature({"organizations:issue-stream-custom-views": True})
@@ -454,17 +699,11 @@ class OrganizationGroupSearchViewsPutTest(BaseGSVTestCase):
         self.get_success_response(self.organization.slug, views=updated_views)
 
         # Then reorder the tabs as if the deleted view is still there
-        view_one = views[0]
-        view_two = views[1]
-        views[0] = view_two
-        views[1] = view_one
+        view_one, view_two = views[0], views[1]
+        views[0], views[1] = view_two, view_one
 
         # Then save the views as if the deleted view is still there
         response = self.get_success_response(self.organization.slug, views=views)
-
-        # We should expect the position of these two views to be swapped in the response
-        view_one["position"] = 1
-        view_two["position"] = 0
 
         assert len(response.data) == 3
         # Unlike in the plain reordering test, the ids are going to be different here but the views are otherwise the same,
@@ -481,7 +720,6 @@ class OrganizationGroupSearchViewsPutTest(BaseGSVTestCase):
         assert len(starred_views) == len(response.data)
         for idx, view in enumerate(response.data):
             assert starred_views[idx].position == idx
-            assert starred_views[idx].position == view["position"]
             assert str(starred_views[idx].group_search_view.id) == view["id"]
 
 
@@ -963,7 +1201,7 @@ class OrganizationGroupSearchViewsGetPageFiltersTest(APITestCase):
         assert response.data["detail"] == "You do not have access to any projects."
 
 
-class OrganizationGroupSearchViewsGetVisibilityTest(APITestCase):
+class OrganizationGroupSearchViewsGetCreatedByQueryParamTest(APITestCase):
     endpoint = "sentry-api-0-organization-group-search-views"
     method = "get"
 
@@ -972,46 +1210,28 @@ class OrganizationGroupSearchViewsGetVisibilityTest(APITestCase):
         self.user_2 = self.create_user()
         self.create_member(organization=self.organization, user=self.user_2)
 
-        self.url = reverse(
-            "sentry-api-0-organization-group-search-views",
-            kwargs={"organization_id_or_slug": self.organization.slug},
-        )
-
-        self.starred_view = GroupSearchView.objects.create(
-            name="User 1's Starred View",
+        # Create views for current user
+        self.my_view_1 = GroupSearchView.objects.create(
+            name="My View 1",
             organization=self.organization,
-            user_id=self.user_1.id,
+            user_id=self.user.id,
             query="is:unresolved",
             query_sort="date",
-            visibility=GroupSearchViewVisibility.OWNER,
-        )
-        GroupSearchViewStarred.objects.create(
-            organization=self.organization,
-            user_id=self.user_1.id,
-            group_search_view=self.starred_view,
-            position=0,
+            visibility=GroupSearchViewVisibility.ORGANIZATION,
         )
 
-        self.unstarred_view = GroupSearchView.objects.create(
-            name="User 1's Unstarred View",
+        self.my_view_2 = GroupSearchView.objects.create(
+            name="My View 2",
             organization=self.organization,
-            user_id=self.user_1.id,
-            query="is:unresolved",
-            query_sort="date",
-            visibility=GroupSearchViewVisibility.OWNER,
+            user_id=self.user.id,
+            query="is:resolved",
+            query_sort="new",
+            visibility=GroupSearchViewVisibility.ORGANIZATION,
         )
 
-        GroupSearchView.objects.create(
-            name="User 2's Unstarred View",
-            organization=self.organization,
-            user_id=self.user_2.id,
-            query="is:unresolved",
-            query_sort="date",
-            visibility=GroupSearchViewVisibility.OWNER,
-        )
-
-        self.organization_view = GroupSearchView.objects.create(
-            name="Organization View",
+        # Create views for another user
+        self.other_view_1 = GroupSearchView.objects.create(
+            name="Other View 1",
             organization=self.organization,
             user_id=self.user_2.id,
             query="is:unresolved",
@@ -1019,63 +1239,85 @@ class OrganizationGroupSearchViewsGetVisibilityTest(APITestCase):
             visibility=GroupSearchViewVisibility.ORGANIZATION,
         )
 
+        self.other_view_2 = GroupSearchView.objects.create(
+            name="Other View 2",
+            organization=self.organization,
+            user_id=self.user_2.id,
+            query="is:resolved",
+            query_sort="new",
+            visibility=GroupSearchViewVisibility.ORGANIZATION,
+        )
+
+        # Create starred views for current user
+        GroupSearchViewStarred.objects.create(
+            organization=self.organization,
+            user_id=self.user.id,
+            group_search_view=self.my_view_1,
+            position=0,
+        )
+
+        GroupSearchViewStarred.objects.create(
+            organization=self.organization,
+            user_id=self.user.id,
+            group_search_view=self.my_view_2,
+            position=1,
+        )
+
     @with_feature({"organizations:issue-stream-custom-views": True})
     @with_feature({"organizations:global-views": True})
-    def test_get_views_no_visibility(self) -> None:
-        self.login_as(user=self.user_1)
-        response = self.client.get(self.url)
+    def test_get_views_created_by_me(self) -> None:
+        self.login_as(user=self.user)
+        response = self.get_success_response(self.organization.slug, createdBy="me")
 
-        assert response.status_code == 200
-        assert len(response.data) == 1
-        assert response.data[0]["id"] == str(self.starred_view.id)
-        assert response.data[0]["name"] == self.starred_view.name
-
-    @with_feature({"organizations:issue-stream-custom-views": True})
-    @with_feature({"organizations:global-views": True})
-    def test_get_views_owner_visibility(self) -> None:
-        self.login_as(user=self.user_1)
-        response = self.client.get(self.url, {"visibility": "owner"})
-
-        assert response.status_code == 200
+        # Should return views created by current user, ordered by name
         assert len(response.data) == 2
-        assert response.data[0]["id"] == str(self.starred_view.id)
-        assert response.data[0]["name"] == self.starred_view.name
-        assert response.data[1]["id"] == str(self.unstarred_view.id)
-        assert response.data[1]["name"] == self.unstarred_view.name
+        assert response.data[0]["id"] == str(self.my_view_1.id)
+        assert response.data[0]["name"] == "My View 1"
+        assert response.data[1]["id"] == str(self.my_view_2.id)
+        assert response.data[1]["name"] == "My View 2"
 
     @with_feature({"organizations:issue-stream-custom-views": True})
     @with_feature({"organizations:global-views": True})
-    def test_get_views_organization_visibility(self) -> None:
-        self.login_as(user=self.user_2)
-        response = self.client.get(self.url, {"visibility": "organization"})
+    def test_get_views_created_by_others(self) -> None:
+        self.login_as(user=self.user)
+        response = self.get_success_response(self.organization.slug, createdBy="others")
 
-        assert response.status_code == 200
-        assert len(response.data) == 1
-        assert response.data[0]["id"] == str(self.organization_view.id)
-        assert response.data[0]["name"] == self.organization_view.name
-
-    @with_feature({"organizations:issue-stream-custom-views": True})
-    @with_feature({"organizations:global-views": True})
-    def test_get_views_with_user_organization_visibility(self) -> None:
-        self.login_as(user=self.user_1)
-        response = self.client.get(self.url, {"visibility": ["owner", "organization"]})
-
-        assert response.status_code == 200
-        assert len(response.data) == 3
-        assert response.data[0]["id"] == str(self.starred_view.id)
-        assert response.data[0]["name"] == self.starred_view.name
-        assert response.data[1]["id"] == str(self.unstarred_view.id)
-        assert response.data[1]["name"] == self.unstarred_view.name
-        assert response.data[2]["id"] == str(self.organization_view.id)
-        assert response.data[2]["name"] == self.organization_view.name
+        # Should return only organization-visible views created by other users
+        assert len(response.data) == 2
+        assert response.data[0]["id"] == str(self.other_view_1.id)
+        assert response.data[0]["name"] == "Other View 1"
+        assert response.data[1]["id"] == str(self.other_view_2.id)
+        assert response.data[1]["name"] == "Other View 2"
 
     @with_feature({"organizations:issue-stream-custom-views": True})
     @with_feature({"organizations:global-views": True})
-    def test_get_views_with_invalid_visibility(self) -> None:
-        self.login_as(user=self.user_1)
-        response = self.client.get(self.url, {"visibility": ["random"]})
+    def test_get_views_without_created_by_param(self) -> None:
+        self.login_as(user=self.user)
+        response = self.get_success_response(self.organization.slug)
+
+        # Should return only starred views for current user
+        assert len(response.data) == 2
+        # Ordered by position in starred views
+        assert response.data[0]["id"] == str(self.my_view_1.id)
+        assert response.data[0]["name"] == "My View 1"
+        assert response.data[1]["id"] == str(self.my_view_2.id)
+        assert response.data[1]["name"] == "My View 2"
+
+    @with_feature({"organizations:issue-stream-custom-views": True})
+    @with_feature({"organizations:global-views": True})
+    def test_invalid_created_by_value(self) -> None:
+        self.login_as(user=self.user)
+        response = self.get_error_response(self.organization.slug, createdBy="invalid")
+
+        # Should return a validation error
         assert response.status_code == 400
-        assert str(response.data["visibility"][0]) == '"random" is not a valid choice.'
+        assert "createdBy" in response.data
+
+    @with_feature({"organizations:issue-stream-custom-views": False})
+    def test_feature_flag_disabled(self) -> None:
+        self.login_as(user=self.user)
+        response = self.get_response(self.organization.slug, createdBy="me")
+        assert response.status_code == 404
 
 
 class OrganizationGroupSearchViewsPutRegressionTest(APITestCase):
@@ -1103,7 +1345,6 @@ class OrganizationGroupSearchViewsPutRegressionTest(APITestCase):
         assert view["name"] == "Prioritized"
         assert view["query"] == "is:unresolved issue.priority:[high, medium]"
         assert view["querySort"] == "date"
-        assert view["position"] == 0
 
         # create a new custom view
         views.append(
